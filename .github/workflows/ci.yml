@@ -53,6 +53,18 @@ jobs:
         cache-to: type=gha,mode=max
         platforms: linux/amd64,linux/arm64
 
+    - name: Wait for image to be available
+      run: |
+        echo "Waiting for image to be available in registry..."
+        sleep 30
+        
+        # Verify image exists
+        docker manifest inspect ${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ github.sha }} || {
+          echo "Image not found in registry, waiting longer..."
+          sleep 60
+          docker manifest inspect ${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ github.sha }}
+        }
+
     - name: Security scan
       uses: aquasecurity/trivy-action@master
       with:
@@ -75,16 +87,37 @@ jobs:
         git config user.name "GitHub Actions"
         git config user.email "actions@github.com"
         
-        # Update the deployment file
-        DEPLOYMENT_FILE="k8s/deployments/bedrock-service-deployment.yaml"
+        # Check if deployment file exists
+        DEPLOYMENT_FILE="deployments/bedrock-service-deployment.yaml"
+        
+        if [ ! -f "$DEPLOYMENT_FILE" ]; then
+          echo "Error: Deployment file $DEPLOYMENT_FILE not found!"
+          echo "Available files in deployments/:"
+          ls -la deployments/ || echo "deployments/ directory not found"
+          echo "Repository structure:"
+          find . -name "*.yaml" -type f
+          exit 1
+        fi
+        
+        # Show current image tag
+        echo "Current deployment file content:"
+        grep "image:" $DEPLOYMENT_FILE || echo "No image: line found"
         
         # Replace image tag with new SHA
         sed -i "s|${{ env.IMAGE_NAME }}:.*|${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${IMAGE_TAG}|g" $DEPLOYMENT_FILE
         
+        # Show updated content
+        echo "Updated deployment file content:"
+        grep "image:" $DEPLOYMENT_FILE
+        
         # Commit and push changes
         git add .
-        git commit -m "Update bedrock-service image to ${{ github.ref_name }}-${IMAGE_TAG} [skip ci]" || exit 0
-        git push origin main
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "Update bedrock-service image to ${{ github.ref_name }}-${IMAGE_TAG} [skip ci]"
+          git push origin main
+        fi
 
     - name: Trigger deployment
       if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
@@ -93,6 +126,8 @@ jobs:
         if [ "${{ github.ref }}" = "refs/heads/develop" ]; then
           ENV="staging"
         fi
+        
+        echo "Triggering deployment for $ENV environment"
         
         curl -X POST \
           -H "Authorization: token ${{ secrets.MANIFEST_REPO_TOKEN }}" \
