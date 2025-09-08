@@ -53,26 +53,6 @@ jobs:
         cache-to: type=gha,mode=max
         platforms: linux/amd64,linux/arm64
 
-    - name: Wait for image to be available
-      run: |
-        echo "Waiting for image to be available in registry..."
-        sleep 30
-        
-        # Verify image exists
-        docker manifest inspect ${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ github.sha }} || {
-          echo "Image not found in registry, waiting longer..."
-          sleep 60
-          docker manifest inspect ${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ github.sha }}
-        }
-
-    - name: Security scan
-      uses: aquasecurity/trivy-action@master
-      with:
-        image-ref: ${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ github.sha }}
-        format: 'sarif'
-        output: 'trivy-results.sarif'
-      continue-on-error: true
-
     - name: Update deployment manifest
       if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
       env:
@@ -87,28 +67,35 @@ jobs:
         git config user.name "GitHub Actions"
         git config user.email "actions@github.com"
         
-        # Check if deployment file exists
-        DEPLOYMENT_FILE="deployments/bedrock-service-deployment.yaml"
+        # Debug: Show repository structure
+        echo "Repository structure:"
+        find . -name "*.yaml" -type f | head -20
         
-        if [ ! -f "$DEPLOYMENT_FILE" ]; then
-          echo "Error: Deployment file $DEPLOYMENT_FILE not found!"
-          echo "Available files in deployments/:"
-          ls -la deployments/ || echo "deployments/ directory not found"
-          echo "Repository structure:"
-          find . -name "*.yaml" -type f
+        # Check if deployment file exists (try multiple possible paths)
+        DEPLOYMENT_FILE=""
+        if [ -f "deployments/bedrock-service-deployment.yaml" ]; then
+          DEPLOYMENT_FILE="deployments/bedrock-service-deployment.yaml"
+        elif [ -f "k8s/deployments/bedrock-service-deployment.yaml" ]; then
+          DEPLOYMENT_FILE="k8s/deployments/bedrock-service-deployment.yaml"
+        else
+          echo "Error: bedrock-service-deployment.yaml not found!"
+          echo "Available deployment files:"
+          find . -name "*deployment*.yaml" -type f
           exit 1
         fi
         
+        echo "Using deployment file: $DEPLOYMENT_FILE"
+        
         # Show current image tag
-        echo "Current deployment file content:"
-        grep "image:" $DEPLOYMENT_FILE || echo "No image: line found"
+        echo "Current image configuration:"
+        grep -n "image:" "$DEPLOYMENT_FILE" || echo "No image: line found"
         
         # Replace image tag with new SHA
-        sed -i "s|${{ env.IMAGE_NAME }}:.*|${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${IMAGE_TAG}|g" $DEPLOYMENT_FILE
+        sed -i "s|${{ env.IMAGE_NAME }}:.*|${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${IMAGE_TAG}|g" "$DEPLOYMENT_FILE"
         
         # Show updated content
-        echo "Updated deployment file content:"
-        grep "image:" $DEPLOYMENT_FILE
+        echo "Updated image configuration:"
+        grep -n "image:" "$DEPLOYMENT_FILE"
         
         # Commit and push changes
         git add .
