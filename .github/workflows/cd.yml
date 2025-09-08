@@ -1,71 +1,136 @@
-# .github/workflows/cd.yml
-name: CD - Deploy Bedrock Service
+# .github/workflows/ci.yml
+name: CI - Build and Push
 
 on:
-  repository_dispatch:
-    types: [deploy-bedrock-service]
+  push:
+    branches: [ main, develop ]
+    paths:
+      - '**'
+      - '!README.md'
+      - '!.github/**'
+  pull_request:
+    branches: [ main ]
 
 env:
-  KUBE_CONFIG_DATA: ${{ secrets.KUBE_CONFIG_DATA }}
+  REGISTRY: docker.io
+  IMAGE_NAME: samitsinghhh/bedrock-service
 
 jobs:
-  deploy:
+  build-and-push:
     runs-on: ubuntu-latest
     
     steps:
-    - name: Checkout deployment repository
+    - name: Checkout code
       uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Login to Docker Hub
+      uses: docker/login-action@v3
       with:
-        repository: ${{ github.repository_owner }}/k8s-manifests
-        token: ${{ secrets.MANIFEST_REPO_TOKEN }}
-        
-    - name: Setup kubectl
-      uses: azure/setup-kubectl@v3
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
       with:
-        version: 'latest'
-        
-    - name: Configure kubectl
+        images: ${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64,linux/arm64
+
+    - name: Wait for image to be available
       run: |
-        echo "${{ env.KUBE_CONFIG_DATA }}" | base64 -d > kubeconfig
-        export KUBECONFIG=kubeconfig
-        kubectl config current-context
-        
-    - name: Deploy to Kubernetes
-      run: |
-        export KUBECONFIG=kubeconfig
-        
-        # Determine environment
-        if [ "${{ github.event.client_payload.environment }}" = "production" ]; then
-          NAMESPACE="bedrock-chat-v2"
-        else
-          NAMESPACE="bedrock-chat-staging"
-        fi
-        
-        echo "Deploying bedrock-service to $NAMESPACE"
-        
-        # Apply the deployment
-        kubectl apply -f k8s/deployments/bedrock-service-deployment.yaml -n $NAMESPACE
-        
-        # Wait for rollout to complete
-        kubectl rollout status deployment/bedrock-service -n $NAMESPACE --timeout=300s
-        
-        # Verify deployment
-        kubectl get pods -l app=bedrock-service -n $NAMESPACE
-        
-    - name: Health check
-      run: |
-        export KUBECONFIG=kubeconfig
-        
-        if [ "${{ github.event.client_payload.environment }}" = "production" ]; then
-          NAMESPACE="bedrock-chat-v2"
-        else
-          NAMESPACE="bedrock-chat-staging"
-        fi
-        
-        # Wait for service to be ready
+        echo "Waiting for image to be available in registry..."
         sleep 30
         
-        # Test bedrock service health
-        kubectl exec -n $NAMESPACE deployment/bedrock-service -- wget -qO- --timeout=10 http://localhost:9000/health || exit 1
+        # Verify image exists
+        docker manifest inspect ${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ github.sha }} || {
+          echo "Image not found in registry, waiting longer..."
+          sleep 60
+          docker manifest inspect ${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ github.sha }}
+        }
+
+    - name: Security scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ github.sha }}
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+      continue-on-error: true
+
+    - name: Update deployment manifest
+      if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+      env:
+        GITHUB_TOKEN: ${{ secrets.MANIFEST_REPO_TOKEN }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        # Clone the k8s-manifests repository
+        git clone https://github.com/${{ github.repository_owner }}/k8s-manifests.git
+        cd k8s-manifests
         
-        echo "Bedrock service deployment successful and health check passed!"
+        # Configure git
+        git config user.name "GitHub Actions"
+        git config user.email "actions@github.com"
+        
+        # Check if deployment file exists
+        DEPLOYMENT_FILE="k8s/deployments/bedrock-service-deployment.yaml"
+        
+        if [ ! -f "$DEPLOYMENT_FILE" ]; then
+          echo "Error: Deployment file $DEPLOYMENT_FILE not found!"
+          echo "Available files in k8s/deployments/:"
+          ls -la k8s/deployments/ || echo "k8s/deployments/ directory not found"
+          echo "Repository structure:"
+          find . -name "*.yaml" -type f
+          exit 1
+        fi
+        
+        # Show current image tag
+        echo "Current deployment file content:"
+        grep "image:" $DEPLOYMENT_FILE || echo "No image: line found"
+        
+        # Replace image tag with new SHA
+        sed -i "s|${{ env.IMAGE_NAME }}:.*|${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${IMAGE_TAG}|g" $DEPLOYMENT_FILE
+        
+        # Show updated content
+        echo "Updated deployment file content:"
+        grep "image:" $DEPLOYMENT_FILE
+        
+        # Commit and push changes
+        git add .
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "Update bedrock-service image to ${{ github.ref_name }}-${IMAGE_TAG} [skip ci]"
+          git push origin main
+        fi
+
+    - name: Trigger deployment
+      if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+      run: |
+        ENV="production"
+        if [ "${{ github.ref }}" = "refs/heads/develop" ]; then
+          ENV="staging"
+        fi
+        
+        echo "Triggering deployment for $ENV environment"
+        
+        curl -X POST \
+          -H "Authorization: token ${{ secrets.MANIFEST_REPO_TOKEN }}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          https://api.github.com/repos/${{ github.repository_owner }}/k8s-manifests/dispatches \
+          -d "{\"event_type\":\"deploy-bedrock-service\",\"client_payload\":{\"environment\":\"$ENV\",\"image_tag\":\"${{ github.ref_name }}-${{ github.sha }}\"}}"
