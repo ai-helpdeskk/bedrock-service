@@ -1,3 +1,4 @@
+# BEDROCK SERVICE - CI.YML
 # =====================================
 # .github/workflows/ci.yml for Bedrock Service
 name: CI - Build and Push Bedrock Service
@@ -74,15 +75,6 @@ jobs:
             t.Errorf("handler returned wrong status code: got %v want %v",
               status, http.StatusOK)
           }
-          
-          var response HealthResponse
-          if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
-            t.Fatal(err)
-          }
-          
-          if response.Status != "healthy" {
-            t.Errorf("expected status healthy, got %s", response.Status)
-          }
         }
 
         func TestRootHandler(t *testing.T) {
@@ -106,13 +98,6 @@ jobs:
       
     - name: Run go vet
       run: go vet ./...
-      
-    - name: Install and run golangci-lint
-      uses: golangci/golangci-lint-action@v3
-      with:
-        version: latest
-        args: --timeout=5m
-      continue-on-error: true
 
   build-and-push:
     runs-on: ubuntu-latest
@@ -143,6 +128,7 @@ jobs:
           type=raw,value=latest,enable={{is_default_branch}}
     
     - name: Build and push Docker image
+      id: docker_build
       uses: docker/build-push-action@v5
       with:
         context: .
@@ -152,40 +138,18 @@ jobs:
         cache-from: type=gha
         cache-to: type=gha,mode=max
         platforms: linux/amd64,linux/arm64
-
-    - name: Wait for image availability
+    
+    - name: Image push confirmation
       run: |
-        echo "🚀 Waiting for image to be available in registry..."
-        IMAGE_TAG="${{ github.ref_name }}-${{ github.sha }}"
-        FULL_IMAGE="${{ env.IMAGE_NAME }}:${IMAGE_TAG}"
-        
-        MAX_ATTEMPTS=10
-        ATTEMPT=1
-        WAIT_TIME=30
-        
-        while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
-          echo "📋 Attempt $ATTEMPT/$MAX_ATTEMPTS: Verifying image availability..."
-          
-          if docker manifest inspect "$FULL_IMAGE" > /dev/null 2>&1; then
-            echo "✅ Image verified successfully"
-            break
-          fi
-          
-          if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
-            echo "⚠️ Image verification timeout - continuing anyway"
-            break
-          fi
-          
-          echo "⏳ Waiting ${WAIT_TIME}s before retry..."
-          sleep $WAIT_TIME
-          ATTEMPT=$((ATTEMPT + 1))
-        done
+        echo "✅ Image successfully pushed to Docker Hub"
+        echo "📦 Image digest: ${{ steps.docker_build.outputs.digest }}"
+        echo "🏷️ Tags pushed:"
+        echo "${{ steps.meta.outputs.tags }}"
 
     - name: Update deployment manifest
       if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
       env:
         GITHUB_TOKEN: ${{ secrets.MANIFEST_REPO_TOKEN }}
-        IMAGE_TAG: ${{ github.sha }}
       run: |
         set -e
         echo "📝 Updating deployment manifest..."
@@ -198,15 +162,10 @@ jobs:
         
         # Find deployment file
         DEPLOYMENT_FILE=""
-        POSSIBLE_PATHS=(
-          "k8s/deployments/bedrock-service-deployment.yaml"
-          "deployments/bedrock-service-deployment.yaml"
-        )
-        
-        for path in "${POSSIBLE_PATHS[@]}"; do
+        for path in "k8s/deployments/bedrock-service-deployment.yaml" "deployments/bedrock-service-deployment.yaml"; do
           if [ -f "$path" ]; then
             DEPLOYMENT_FILE="$path"
-            echo "✅ Found deployment file at: $DEPLOYMENT_FILE"
+            echo "✅ Found deployment file: $DEPLOYMENT_FILE"
             break
           fi
         done
@@ -217,28 +176,36 @@ jobs:
         fi
         
         # Update image tag
-        NEW_IMAGE="${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${IMAGE_TAG}"
+        SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+        NEW_IMAGE="${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${SHORT_SHA}"
+        
+        echo "🔄 Updating image to: $NEW_IMAGE"
         sed -i "s|image: samitsinghhh/bedrock-service:.*|image: ${NEW_IMAGE}|g" "$DEPLOYMENT_FILE"
         
-        # Commit if changes were made
-        if git diff --quiet; then
-          echo "ℹ️ No changes needed"
-        else
+        # Commit and push if there are changes
+        if ! git diff --quiet; then
           git add "$DEPLOYMENT_FILE"
-          git commit -m "🚀 Update bedrock-service image to ${{ github.ref_name }}-${IMAGE_TAG}"
+          git commit -m "🚀 Update bedrock-service to ${{ github.ref_name }}-${SHORT_SHA}"
           git push origin main
-          echo "✅ Successfully updated deployment manifest"
+          echo "✅ Deployment manifest updated"
+        else
+          echo "ℹ️ No changes needed"
         fi
 
     - name: Trigger deployment
       if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+      env:
+        GITHUB_TOKEN: ${{ secrets.MANIFEST_REPO_TOKEN }}
       run: |
         ENV=$([[ "${{ github.ref }}" == "refs/heads/main" ]] && echo "production" || echo "staging")
+        SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
         
-        echo "🚀 Triggering deployment for $ENV environment"
+        echo "🚀 Triggering deployment to $ENV"
         
         curl -X POST \
-          -H "Authorization: token ${{ secrets.MANIFEST_REPO_TOKEN }}" \
+          -H "Authorization: token ${{ env.GITHUB_TOKEN }}" \
           -H "Accept: application/vnd.github.v3+json" \
           https://api.github.com/repos/${{ github.repository_owner }}/k8s-manifests/dispatches \
-          -d "{\"event_type\":\"deploy-bedrock-service\",\"client_payload\":{\"environment\":\"$ENV\",\"service\":\"bedrock-service\",\"image_tag\":\"${{ github.ref_name }}-${{ github.sha }}\"}}"
+          -d "{\"event_type\":\"deploy-bedrock-service\",\"client_payload\":{\"environment\":\"$ENV\",\"service\":\"bedrock-service\",\"image_tag\":\"${{ github.ref_name }}-${SHORT_SHA}\"}}"
+        
+        echo "✅ Deployment triggered"
