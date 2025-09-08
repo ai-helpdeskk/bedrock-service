@@ -1,4 +1,4 @@
-# .github/workflows/ci.yml
+# .github/workflows/ci.yml for Bedrock Service
 name: CI - Build and Push Bedrock Service
 
 on:
@@ -35,15 +35,100 @@ jobs:
         key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
         restore-keys: |
           ${{ runner.os }}-go-
+    
+    - name: Initialize Go module
+      run: |
+        if [ ! -f go.sum ]; then
+          go mod download
+          go mod tidy
+        fi
         
     - name: Download dependencies
       run: go mod download
+      
+    - name: Create basic test if not exists
+      run: |
+        if [ ! -f "*_test.go" ]; then
+          cat > main_test.go << 'EOF'
+        package main
+
+        import (
+          "testing"
+          "net/http"
+          "net/http/httptest"
+          "encoding/json"
+        )
+
+        func TestHealthHandler(t *testing.T) {
+          // Mock BedrockClient
+          bc := &BedrockClient{
+            availableModels: []ModelInfo{
+              {ID: "test-model", Name: "Test Model", Available: true},
+            },
+          }
+          
+          req, err := http.NewRequest("GET", "/health", nil)
+          if err != nil {
+            t.Fatal(err)
+          }
+          
+          rr := httptest.NewRecorder()
+          handler := healthHandler(bc)
+          handler.ServeHTTP(rr, req)
+          
+          if status := rr.Code; status != http.StatusOK {
+            t.Errorf("handler returned wrong status code: got %v want %v",
+              status, http.StatusOK)
+          }
+          
+          var response HealthResponse
+          if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+            t.Fatal(err)
+          }
+          
+          if response.Status != "healthy" {
+            t.Errorf("expected status healthy, got %s", response.Status)
+          }
+        }
+
+        func TestRootHandler(t *testing.T) {
+          req, err := http.NewRequest("GET", "/", nil)
+          if err != nil {
+            t.Fatal(err)
+          }
+          
+          rr := httptest.NewRecorder()
+          rootHandler(rr, req)
+          
+          if status := rr.Code; status != http.StatusOK {
+            t.Errorf("handler returned wrong status code: got %v want %v",
+              status, http.StatusOK)
+          }
+          
+          var response map[string]string
+          if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+            t.Fatal(err)
+          }
+          
+          if _, ok := response["message"]; !ok {
+            t.Error("expected message field in response")
+          }
+        }
+        EOF
+        fi
       
     - name: Run tests
       run: go test -v ./...
       
     - name: Run go vet
       run: go vet ./...
+      
+    - name: Run static analysis
+      uses: dominikh/staticcheck-action@v1.3.0
+      with:
+        version: "2023.1.6"
+        install-go: false
+      continue-on-error: true
 
   build-and-push:
     runs-on: ubuntu-latest
@@ -82,29 +167,27 @@ jobs:
         labels: ${{ steps.meta.outputs.labels }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
-        platforms: linux/amd64,linux/arm64
+        platforms: linux/amd64
 
     - name: Wait for image availability
       run: |
         echo "Waiting for image to be available in registry..."
         sleep 30
         
-        # Check if image exists
         IMAGE_TAG="${{ github.ref_name }}-${{ github.sha }}"
         echo "Checking for image: ${{ env.IMAGE_NAME }}:${IMAGE_TAG}"
         
-        # Retry logic for image verification
-        for i in {1..5}; do
+        for i in {1..6}; do
           if docker manifest inspect ${{ env.IMAGE_NAME }}:${IMAGE_TAG} > /dev/null 2>&1; then
             echo "✅ Image verified successfully"
             break
           else
             echo "⏳ Attempt $i: Image not yet available, waiting..."
-            sleep 15
+            sleep 20
           fi
           
-          if [ $i -eq 5 ]; then
-            echo "❌ Image verification failed after 5 attempts"
+          if [ $i -eq 6 ]; then
+            echo "❌ Image verification failed after 6 attempts"
             exit 1
           fi
         done
@@ -117,26 +200,22 @@ jobs:
       run: |
         set -e
         
-        # Clone the k8s-manifests repository
+        echo "Cloning k8s-manifests repository..."
         git clone https://github.com/${{ github.repository_owner }}/k8s-manifests.git
         cd k8s-manifests
         
-        # Configure git
         git config user.name "GitHub Actions Bot"
         git config user.email "actions@github.com"
-        
-        # Debug: Show repository structure
-        echo "=== Repository Structure ==="
-        find . -name "*bedrock*" -type f | head -10
         
         # Find the deployment file
         DEPLOYMENT_FILE=""
         POSSIBLE_PATHS=(
-          "k8s/deployments/bedrock-service-deployment.yaml"
           "deployments/bedrock-service-deployment.yaml"
+          "k8s/deployments/bedrock-service-deployment.yaml"
           "manifests/bedrock-service-deployment.yaml"
         )
         
+        echo "Looking for deployment file..."
         for path in "${POSSIBLE_PATHS[@]}"; do
           if [ -f "$path" ]; then
             DEPLOYMENT_FILE="$path"
@@ -147,22 +226,22 @@ jobs:
         
         if [ -z "$DEPLOYMENT_FILE" ]; then
           echo "❌ ERROR: bedrock-service-deployment.yaml not found!"
-          echo "Available YAML files:"
-          find . -name "*.yaml" -type f | grep -i bedrock || echo "No bedrock files found"
+          echo "Available files:"
+          find . -name "*.yaml" -type f | head -20
           exit 1
         fi
         
-        # Backup and update the deployment file
+        # Update image tag
         cp "$DEPLOYMENT_FILE" "${DEPLOYMENT_FILE}.backup"
+        NEW_IMAGE="${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${IMAGE_TAG}"
         
-        echo "=== Current Image Configuration ==="
+        echo "Updating image from:"
         grep -n "image:" "$DEPLOYMENT_FILE" || echo "No image lines found"
         
-        # Update image tag - more specific pattern
-        NEW_IMAGE="${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${IMAGE_TAG}"
-        sed -i "s|samitsinghhh/bedrock-service:.*|${NEW_IMAGE}|g" "$DEPLOYMENT_FILE"
+        # Use more specific sed pattern
+        sed -i "s|image: samitsinghhh/bedrock-service:.*|image: ${NEW_IMAGE}|g" "$DEPLOYMENT_FILE"
         
-        echo "=== Updated Image Configuration ==="
+        echo "Updated image to:"
         grep -n "image:" "$DEPLOYMENT_FILE"
         
         # Check if changes were made
@@ -171,7 +250,6 @@ jobs:
           exit 0
         fi
         
-        # Commit and push changes
         git add "$DEPLOYMENT_FILE"
         git commit -m "🚀 Update bedrock-service image to ${{ github.ref_name }}-${IMAGE_TAG}"
         git push origin main
@@ -181,7 +259,6 @@ jobs:
     - name: Trigger deployment
       if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
       run: |
-        # Determine environment
         if [ "${{ github.ref }}" = "refs/heads/main" ]; then
           ENV="production"
         else
@@ -190,7 +267,6 @@ jobs:
         
         echo "🚀 Triggering deployment for $ENV environment"
         
-        # Trigger deployment via repository dispatch
         curl -X POST \
           -H "Authorization: token ${{ secrets.MANIFEST_REPO_TOKEN }}" \
           -H "Accept: application/vnd.github.v3+json" \
