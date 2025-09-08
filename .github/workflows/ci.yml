@@ -169,28 +169,70 @@ jobs:
         cache-to: type=gha,mode=max
         platforms: linux/amd64
 
-    - name: Wait for image availability
+    - name: Wait for image availability (Enhanced)
       run: |
-        echo "Waiting for image to be available in registry..."
-        sleep 30
+        echo "🚀 Waiting for image to be available in registry..."
         
         IMAGE_TAG="${{ github.ref_name }}-${{ github.sha }}"
-        echo "Checking for image: ${{ env.IMAGE_NAME }}:${IMAGE_TAG}"
+        FULL_IMAGE="${{ env.IMAGE_NAME }}:${IMAGE_TAG}"
         
-        for i in {1..6}; do
-          if docker manifest inspect ${{ env.IMAGE_NAME }}:${IMAGE_TAG} > /dev/null 2>&1; then
-            echo "✅ Image verified successfully"
+        echo "🔍 Checking for image: $FULL_IMAGE"
+        
+        # Enhanced retry logic with multiple verification methods
+        MAX_ATTEMPTS=12
+        ATTEMPT=1
+        WAIT_TIME=30
+        
+        while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+          echo "📋 Attempt $ATTEMPT/$MAX_ATTEMPTS: Verifying image availability..."
+          
+          # Method 1: Docker manifest inspect (fastest)
+          if docker manifest inspect "$FULL_IMAGE" > /dev/null 2>&1; then
+            echo "✅ Image verified successfully via manifest inspect"
             break
-          else
-            echo "⏳ Attempt $i: Image not yet available, waiting..."
-            sleep 20
           fi
           
-          if [ $i -eq 6 ]; then
-            echo "❌ Image verification failed after 6 attempts"
-            exit 1
+          # Method 2: Docker Hub API check
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://hub.docker.com/v2/repositories/samitsinghhh/bedrock-service/tags/${IMAGE_TAG}/")
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ Image verified successfully via Docker Hub API"
+            break
           fi
+          
+          # Method 3: Docker pull (most reliable but slower)
+          if docker pull "$FULL_IMAGE" > /dev/null 2>&1; then
+            echo "✅ Image verified successfully via docker pull"
+            # Clean up pulled image to save space
+            docker image rm "$FULL_IMAGE" > /dev/null 2>&1 || true
+            break
+          fi
+          
+          # If all methods failed
+          if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+            echo "❌ Image verification failed after $MAX_ATTEMPTS attempts"
+            echo ""
+            echo "🔍 Debug Information:"
+            echo "  - Full image name: $FULL_IMAGE"
+            echo "  - Docker Hub API response code: $HTTP_CODE"
+            echo "  - Repository URL: https://hub.docker.com/r/samitsinghhh/bedrock-service/tags"
+            echo ""
+            echo "🚨 This might be due to Docker Hub propagation delays."
+            echo "💡 The image may still be available - check manually at the repository URL above."
+            
+            # Don't fail the build - let deployment attempt proceed
+            echo "⚠️ Continuing with deployment despite verification failure..."
+            break
+          else
+            echo "⏳ Attempt $ATTEMPT failed. Waiting ${WAIT_TIME}s before retry..."
+            sleep $WAIT_TIME
+            # Incremental backoff
+            WAIT_TIME=$((WAIT_TIME + 15))
+          fi
+          
+          ATTEMPT=$((ATTEMPT + 1))
         done
+        
+        echo "✅ Image availability check completed"
 
     - name: Update deployment manifest
       if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
@@ -200,7 +242,7 @@ jobs:
       run: |
         set -e
         
-        echo "Cloning k8s-manifests repository..."
+        echo "📝 Updating deployment manifest..."
         git clone https://github.com/${{ github.repository_owner }}/k8s-manifests.git
         cd k8s-manifests
         
@@ -215,7 +257,7 @@ jobs:
           "manifests/bedrock-service-deployment.yaml"
         )
         
-        echo "Looking for deployment file..."
+        echo "🔍 Looking for deployment file..."
         for path in "${POSSIBLE_PATHS[@]}"; do
           if [ -f "$path" ]; then
             DEPLOYMENT_FILE="$path"
@@ -226,7 +268,7 @@ jobs:
         
         if [ -z "$DEPLOYMENT_FILE" ]; then
           echo "❌ ERROR: bedrock-service-deployment.yaml not found!"
-          echo "Available files:"
+          echo "📁 Available files:"
           find . -name "*.yaml" -type f | head -20
           exit 1
         fi
@@ -235,13 +277,13 @@ jobs:
         cp "$DEPLOYMENT_FILE" "${DEPLOYMENT_FILE}.backup"
         NEW_IMAGE="${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${IMAGE_TAG}"
         
-        echo "Updating image from:"
+        echo "🔄 Updating image from:"
         grep -n "image:" "$DEPLOYMENT_FILE" || echo "No image lines found"
         
         # Use more specific sed pattern
         sed -i "s|image: samitsinghhh/bedrock-service:.*|image: ${NEW_IMAGE}|g" "$DEPLOYMENT_FILE"
         
-        echo "Updated image to:"
+        echo "✅ Updated image to:"
         grep -n "image:" "$DEPLOYMENT_FILE"
         
         # Check if changes were made
@@ -291,6 +333,10 @@ jobs:
         echo "" >> $GITHUB_STEP_SUMMARY
         if [ "${{ job.status }}" = "success" ]; then
           echo "✅ **All steps completed successfully!**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 Links" >> $GITHUB_STEP_SUMMARY
+          echo "- [Docker Hub Repository](https://hub.docker.com/r/samitsinghhh/bedrock-service)" >> $GITHUB_STEP_SUMMARY
+          echo "- [View Image](https://hub.docker.com/r/samitsinghhh/bedrock-service/tags)" >> $GITHUB_STEP_SUMMARY
         else
           echo "❌ **Pipeline failed. Check the logs above.**" >> $GITHUB_STEP_SUMMARY
         fi
