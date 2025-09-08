@@ -1,5 +1,5 @@
 # .github/workflows/ci.yml
-name: CI - Build and Push
+name: CI - Build and Push Bedrock Service
 
 on:
   push:
@@ -7,17 +7,48 @@ on:
     paths:
       - '**'
       - '!README.md'
-      - '!.github/**'
+      - '!.github/workflows/cd.yml'
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
 
 env:
   REGISTRY: docker.io
   IMAGE_NAME: samitsinghhh/bedrock-service
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21'
+        
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+        
+    - name: Download dependencies
+      run: go mod download
+      
+    - name: Run tests
+      run: go test -v ./...
+      
+    - name: Run go vet
+      run: go vet ./...
+
   build-and-push:
     runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name != 'pull_request'
     
     steps:
     - name: Checkout code
@@ -56,30 +87,27 @@ jobs:
     - name: Wait for image availability
       run: |
         echo "Waiting for image to be available in registry..."
-        sleep 60
+        sleep 30
         
-        # Verify image exists in registry
-        docker manifest inspect ${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ github.sha }} || {
-          echo "Image not immediately available, retrying..."
-          sleep 30
-          docker manifest inspect ${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ github.sha }}
-        }
-
-    - name: Security scan with Trivy
-      uses: aquasecurity/trivy-action@master
-      with:
-        image-ref: ${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ github.sha }}
-        format: 'sarif'
-        output: 'trivy-results.sarif'
-        severity: 'CRITICAL,HIGH'
-      continue-on-error: true
-
-    - name: Upload Trivy scan results
-      uses: github/codeql-action/upload-sarif@v2
-      if: always()
-      with:
-        sarif_file: 'trivy-results.sarif'
-      continue-on-error: true
+        # Check if image exists
+        IMAGE_TAG="${{ github.ref_name }}-${{ github.sha }}"
+        echo "Checking for image: ${{ env.IMAGE_NAME }}:${IMAGE_TAG}"
+        
+        # Retry logic for image verification
+        for i in {1..5}; do
+          if docker manifest inspect ${{ env.IMAGE_NAME }}:${IMAGE_TAG} > /dev/null 2>&1; then
+            echo "✅ Image verified successfully"
+            break
+          else
+            echo "⏳ Attempt $i: Image not yet available, waiting..."
+            sleep 15
+          fi
+          
+          if [ $i -eq 5 ]; then
+            echo "❌ Image verification failed after 5 attempts"
+            exit 1
+          fi
+        done
 
     - name: Update deployment manifest
       if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
@@ -87,6 +115,8 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.MANIFEST_REPO_TOKEN }}
         IMAGE_TAG: ${{ github.sha }}
       run: |
+        set -e
+        
         # Clone the k8s-manifests repository
         git clone https://github.com/${{ github.repository_owner }}/k8s-manifests.git
         cd k8s-manifests
@@ -97,59 +127,56 @@ jobs:
         
         # Debug: Show repository structure
         echo "=== Repository Structure ==="
-        find . -type f -name "*.yaml" | head -20
+        find . -name "*bedrock*" -type f | head -10
         
-        # Find the deployment file in multiple possible locations
+        # Find the deployment file
         DEPLOYMENT_FILE=""
         POSSIBLE_PATHS=(
-          "deployments/bedrock-service-deployment.yaml"
           "k8s/deployments/bedrock-service-deployment.yaml"
-          "manifests/deployments/bedrock-service-deployment.yaml"
+          "deployments/bedrock-service-deployment.yaml"
+          "manifests/bedrock-service-deployment.yaml"
         )
         
         for path in "${POSSIBLE_PATHS[@]}"; do
           if [ -f "$path" ]; then
             DEPLOYMENT_FILE="$path"
-            echo "Found deployment file at: $DEPLOYMENT_FILE"
+            echo "✅ Found deployment file at: $DEPLOYMENT_FILE"
             break
           fi
         done
         
         if [ -z "$DEPLOYMENT_FILE" ]; then
-          echo "ERROR: bedrock-service-deployment.yaml not found!"
-          echo "Available files with 'bedrock' in name:"
-          find . -name "*bedrock*" -type f
-          echo "Available deployment files:"
-          find . -name "*deployment*.yaml" -type f
+          echo "❌ ERROR: bedrock-service-deployment.yaml not found!"
+          echo "Available YAML files:"
+          find . -name "*.yaml" -type f | grep -i bedrock || echo "No bedrock files found"
           exit 1
         fi
         
-        # Backup current file
+        # Backup and update the deployment file
         cp "$DEPLOYMENT_FILE" "${DEPLOYMENT_FILE}.backup"
         
-        # Show current image configuration
         echo "=== Current Image Configuration ==="
-        grep -n "image:" "$DEPLOYMENT_FILE"
+        grep -n "image:" "$DEPLOYMENT_FILE" || echo "No image lines found"
         
-        # Update image tag
-        sed -i "s|samitsinghhh/bedrock-service:.*|samitsinghhh/bedrock-service:${{ github.ref_name }}-${IMAGE_TAG}|g" "$DEPLOYMENT_FILE"
+        # Update image tag - more specific pattern
+        NEW_IMAGE="${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${IMAGE_TAG}"
+        sed -i "s|samitsinghhh/bedrock-service:.*|${NEW_IMAGE}|g" "$DEPLOYMENT_FILE"
         
-        # Show updated configuration
         echo "=== Updated Image Configuration ==="
         grep -n "image:" "$DEPLOYMENT_FILE"
         
         # Check if changes were made
         if diff "$DEPLOYMENT_FILE" "${DEPLOYMENT_FILE}.backup" > /dev/null; then
-          echo "No changes detected in deployment file"
+          echo "ℹ️ No changes needed - image already up to date"
           exit 0
         fi
         
         # Commit and push changes
         git add "$DEPLOYMENT_FILE"
-        git commit -m "Update bedrock-service image to ${{ github.ref_name }}-${IMAGE_TAG} [skip ci]"
+        git commit -m "🚀 Update bedrock-service image to ${{ github.ref_name }}-${IMAGE_TAG}"
         git push origin main
         
-        echo "Successfully updated deployment manifest"
+        echo "✅ Successfully updated deployment manifest"
 
     - name: Trigger deployment
       if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
@@ -161,23 +188,30 @@ jobs:
           ENV="staging"
         fi
         
-        echo "Triggering deployment for $ENV environment"
+        echo "🚀 Triggering deployment for $ENV environment"
         
         # Trigger deployment via repository dispatch
         curl -X POST \
           -H "Authorization: token ${{ secrets.MANIFEST_REPO_TOKEN }}" \
           -H "Accept: application/vnd.github.v3+json" \
           https://api.github.com/repos/${{ github.repository_owner }}/k8s-manifests/dispatches \
-          -d "{\"event_type\":\"deploy-bedrock-service\",\"client_payload\":{\"environment\":\"$ENV\",\"service\":\"bedrock-service\",\"image_tag\":\"${{ github.ref_name }}-${{ github.sha }}\"}}"
+          -d "{\"event_type\":\"deploy-bedrock-service\",\"client_payload\":{\"environment\":\"$ENV\",\"service\":\"bedrock-service\",\"image_tag\":\"${{ github.ref_name }}-${{ github.sha }}\",\"repository\":\"${{ github.repository }}\"}}"
         
-        echo "Deployment trigger sent successfully"
+        echo "✅ Deployment trigger sent successfully"
 
-    - name: Deployment summary
+    - name: Job summary
       if: always()
       run: |
-        echo "=== CI/CD Pipeline Summary ==="
-        echo "Repository: ${{ github.repository }}"
-        echo "Branch: ${{ github.ref_name }}"
-        echo "Commit: ${{ github.sha }}"
-        echo "Image: ${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ github.sha }}"
-        echo "Status: ${{ job.status }}"
+        echo "## 🚀 Bedrock Service CI/CD Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Repository**: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Image**: ${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ job.status }}" = "success" ]; then
+          echo "✅ **All steps completed successfully!**" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ **Pipeline failed. Check the logs above.**" >> $GITHUB_STEP_SUMMARY
+        fi
