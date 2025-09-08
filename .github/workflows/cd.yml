@@ -1,0 +1,71 @@
+# .github/workflows/cd.yml
+name: CD - Deploy Bedrock Service
+
+on:
+  repository_dispatch:
+    types: [deploy-bedrock-service]
+
+env:
+  KUBE_CONFIG_DATA: ${{ secrets.KUBE_CONFIG_DATA }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout deployment repository
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ github.repository_owner }}/k8s-manifests
+        token: ${{ secrets.MANIFEST_REPO_TOKEN }}
+        
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+        
+    - name: Configure kubectl
+      run: |
+        echo "${{ env.KUBE_CONFIG_DATA }}" | base64 -d > kubeconfig
+        export KUBECONFIG=kubeconfig
+        kubectl config current-context
+        
+    - name: Deploy to Kubernetes
+      run: |
+        export KUBECONFIG=kubeconfig
+        
+        # Determine environment
+        if [ "${{ github.event.client_payload.environment }}" = "production" ]; then
+          NAMESPACE="bedrock-chat-v2"
+        else
+          NAMESPACE="bedrock-chat-staging"
+        fi
+        
+        echo "Deploying bedrock-service to $NAMESPACE"
+        
+        # Apply the deployment
+        kubectl apply -f k8s/deployments/bedrock-service-deployment.yaml -n $NAMESPACE
+        
+        # Wait for rollout to complete
+        kubectl rollout status deployment/bedrock-service -n $NAMESPACE --timeout=300s
+        
+        # Verify deployment
+        kubectl get pods -l app=bedrock-service -n $NAMESPACE
+        
+    - name: Health check
+      run: |
+        export KUBECONFIG=kubeconfig
+        
+        if [ "${{ github.event.client_payload.environment }}" = "production" ]; then
+          NAMESPACE="bedrock-chat-v2"
+        else
+          NAMESPACE="bedrock-chat-staging"
+        fi
+        
+        # Wait for service to be ready
+        sleep 30
+        
+        # Test bedrock service health
+        kubectl exec -n $NAMESPACE deployment/bedrock-service -- wget -qO- --timeout=10 http://localhost:9000/health || exit 1
+        
+        echo "Bedrock service deployment successful and health check passed!"
