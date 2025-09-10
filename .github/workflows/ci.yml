@@ -86,4 +86,525 @@ jobs:
           go mod download
 
       - name: Install gosec
-        run: go install github.com/securecodewarrior
+        run: go install github.com/securecodewarrior/gosec/v2/cmd/gosec@latest
+
+      - name: Run gosec security scan
+        run: |
+          gosec -fmt sarif -out gosec-results.sarif ./... || true
+          gosec -fmt text ./... || true
+
+      - name: Install nancy (vulnerability scanner)
+        run: go install github.com/sonatypecommunity/nancy@latest
+
+      - name: Run nancy vulnerability scan
+        run: |
+          go list -json -deps ./... | nancy sleuth || true
+
+      - name: Upload security reports
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: security-reports-${{ env.SERVICE_NAME }}
+          path: |
+            bedrock-service/gosec-results.sarif
+
+      - name: Upload SARIF file
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: bedrock-service/gosec-results.sarif
+
+  # Unit Tests
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: ['1.20', '1.21']
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go ${{ matrix.go-version }}
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+
+      - name: Download dependencies
+        run: |
+          go mod download
+          go mod tidy
+
+      - name: Create comprehensive test file
+        run: |
+          cat > main_test.go << 'EOF'
+          package main
+
+          import (
+              "bytes"
+              "encoding/json"
+              "net/http"
+              "net/http/httptest"
+              "strings"
+              "testing"
+              "time"
+          )
+
+          func TestHealthHandler(t *testing.T) {
+              bc := &BedrockClient{
+                  availableModels: []ModelInfo{
+                      {ID: "test-model", Name: "Test Model", Available: true},
+                  },
+              }
+              
+              req, err := http.NewRequest("GET", "/health", nil)
+              if err != nil {
+                  t.Fatal(err)
+              }
+              
+              rr := httptest.NewRecorder()
+              handler := healthHandler(bc)
+              handler.ServeHTTP(rr, req)
+              
+              if status := rr.Code; status != http.StatusOK {
+                  t.Errorf("handler returned wrong status code: got %v want %v", status, http.StatusOK)
+              }
+
+              var response HealthResponse
+              if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+                  t.Errorf("Failed to parse response: %v", err)
+              }
+
+              if response.Status != "healthy" {
+                  t.Errorf("Expected status 'healthy', got '%s'", response.Status)
+              }
+
+              if response.Service != "bedrock-service" {
+                  t.Errorf("Expected service 'bedrock-service', got '%s'", response.Service)
+              }
+          }
+
+          func TestRootHandler(t *testing.T) {
+              req, err := http.NewRequest("GET", "/", nil)
+              if err != nil {
+                  t.Fatal(err)
+              }
+              
+              rr := httptest.NewRecorder()
+              rootHandler(rr, req)
+              
+              if status := rr.Code; status != http.StatusOK {
+                  t.Errorf("handler returned wrong status code: got %v want %v", status, http.StatusOK)
+              }
+
+              if !strings.Contains(rr.Body.String(), "Enhanced Bedrock Service") {
+                  t.Errorf("Response does not contain expected message")
+              }
+
+              var response map[string]string
+              if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+                  t.Errorf("Failed to parse JSON response: %v", err)
+              }
+
+              if _, exists := response["version"]; !exists {
+                  t.Errorf("Response missing version field")
+              }
+          }
+
+          func TestModelsHandler(t *testing.T) {
+              bc := &BedrockClient{
+                  availableModels: []ModelInfo{
+                      {ID: "test-model-1", Name: "Test Model 1", Available: true, MessageAPI: true},
+                      {ID: "test-model-2", Name: "Test Model 2", Available: false, MessageAPI: false},
+                  },
+              }
+              
+              req, err := http.NewRequest("GET", "/models", nil)
+              if err != nil {
+                  t.Fatal(err)
+              }
+              
+              rr := httptest.NewRecorder()
+              handler := modelsHandler(bc)
+              handler.ServeHTTP(rr, req)
+              
+              if status := rr.Code; status != http.StatusOK {
+                  t.Errorf("handler returned wrong status code: got %v want %v", status, http.StatusOK)
+              }
+
+              var response map[string]interface{}
+              if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+                  t.Errorf("Failed to parse response: %v", err)
+              }
+
+              models, ok := response["models"].([]interface{})
+              if !ok || len(models) != 2 {
+                  t.Errorf("Expected 2 models in response, got %v", models)
+              }
+          }
+
+          func TestGenerateHandler_InvalidRequest(t *testing.T) {
+              bc := &BedrockClient{
+                  availableModels: []ModelInfo{
+                      {ID: "test-model", Name: "Test Model", Available: true},
+                  },
+              }
+              
+              // Test empty request body
+              req, err := http.NewRequest("POST", "/generate", bytes.NewBuffer([]byte("{}")))
+              if err != nil {
+                  t.Fatal(err)
+              }
+              req.Header.Set("Content-Type", "application/json")
+              
+              rr := httptest.NewRecorder()
+              handler := generateHandler(bc)
+              handler.ServeHTTP(rr, req)
+              
+              if status := rr.Code; status != http.StatusBadRequest {
+                  t.Errorf("handler returned wrong status code: got %v want %v", status, http.StatusBadRequest)
+              }
+          }
+
+          func TestGenerateHandler_ValidRequest(t *testing.T) {
+              bc := &BedrockClient{
+                  availableModels: []ModelInfo{
+                      {ID: "test-model", Name: "Test Model", Available: true},
+                  },
+              }
+              
+              reqBody := GenerateRequest{
+                  Prompt:      "Test prompt",
+                  MaxTokens:   100,
+                  Temperature: 0.7,
+              }
+              
+              jsonBody, _ := json.Marshal(reqBody)
+              req, err := http.NewRequest("POST", "/generate", bytes.NewBuffer(jsonBody))
+              if err != nil {
+                  t.Fatal(err)
+              }
+              req.Header.Set("Content-Type", "application/json")
+              
+              rr := httptest.NewRecorder()
+              handler := generateHandler(bc)
+              handler.ServeHTTP(rr, req)
+              
+              // Without AWS credentials, we expect an error but not bad request
+              if rr.Code == http.StatusBadRequest {
+                  t.Errorf("Valid request should not return bad request status")
+              }
+          }
+
+          func TestBedrockClient_GetAvailableModels(t *testing.T) {
+              bc := &BedrockClient{
+                  availableModels: []ModelInfo{
+                      {ID: "model-1", Name: "Model 1", Available: true},
+                      {ID: "model-2", Name: "Model 2", Available: false},
+                      {ID: "model-3", Name: "Model 3", Available: true},
+                  },
+              }
+              
+              available := bc.GetAvailableModels()
+              expected := []string{"Model 1", "Model 3"}
+              
+              if len(available) != len(expected) {
+                  t.Errorf("Expected %d available models, got %d", len(expected), len(available))
+              }
+              
+              for i, name := range expected {
+                  if i >= len(available) || available[i] != name {
+                      t.Errorf("Expected model '%s' at index %d, got '%s'", name, i, available[i])
+                  }
+              }
+          }
+
+          func TestMinFunction(t *testing.T) {
+              tests := []struct {
+                  a, b, expected int
+              }{
+                  {1, 2, 1},
+                  {5, 3, 3},
+                  {0, 0, 0},
+                  {-1, 1, -1},
+                  {100, 50, 50},
+              }
+              
+              for _, test := range tests {
+                  result := min(test.a, test.b)
+                  if result != test.expected {
+                      t.Errorf("min(%d, %d) = %d, expected %d", test.a, test.b, result, test.expected)
+                  }
+              }
+          }
+
+          func TestModelInfoValidation(t *testing.T) {
+              models := []ModelInfo{
+                  {ID: "anthropic.claude-3-5-sonnet-20241022-v2:0", Name: "Claude 3.5 Sonnet v2", MessageAPI: true},
+                  {ID: "anthropic.claude-v2:1", Name: "Claude v2.1", MessageAPI: false},
+              }
+              
+              for _, model := range models {
+                  if model.ID == "" {
+                      t.Errorf("Model ID should not be empty")
+                  }
+                  if model.Name == "" {
+                      t.Errorf("Model Name should not be empty")
+                  }
+                  
+                  // Test MessageAPI consistency
+                  if strings.Contains(model.ID, "claude-3") && !model.MessageAPI {
+                      t.Errorf("Claude 3+ models should use MessageAPI")
+                  }
+                  if strings.Contains(model.ID, "claude-v2") && model.MessageAPI {
+                      t.Errorf("Claude v2 models should not use MessageAPI")
+                  }
+              }
+          }
+
+          func TestConcurrentRequests(t *testing.T) {
+              bc := &BedrockClient{
+                  availableModels: []ModelInfo{
+                      {ID: "test-model", Name: "Test Model", Available: true},
+                  },
+              }
+              
+              handler := healthHandler(bc)
+              
+              // Test concurrent requests
+              const numRequests = 10
+              done := make(chan bool, numRequests)
+              
+              for i := 0; i < numRequests; i++ {
+                  go func() {
+                      req := httptest.NewRequest("GET", "/health", nil)
+                      rr := httptest.NewRecorder()
+                      handler.ServeHTTP(rr, req)
+                      
+                      if rr.Code != http.StatusOK {
+                          t.Errorf("Concurrent request failed with status %d", rr.Code)
+                      }
+                      done <- true
+                  }()
+              }
+              
+              // Wait for all requests
+              timeout := time.After(5 * time.Second)
+              for i := 0; i < numRequests; i++ {
+                  select {
+                  case <-done:
+                      // Request completed
+                  case <-timeout:
+                      t.Fatal("Timeout waiting for concurrent requests")
+                  }
+              }
+          }
+
+          // Benchmark tests
+          func BenchmarkHealthHandler(b *testing.B) {
+              bc := &BedrockClient{
+                  availableModels: []ModelInfo{
+                      {ID: "test-model", Name: "Test Model", Available: true},
+                  },
+              }
+              
+              handler := healthHandler(bc)
+              
+              b.ResetTimer()
+              for i := 0; i < b.N; i++ {
+                  req := httptest.NewRequest("GET", "/health", nil)
+                  rr := httptest.NewRecorder()
+                  handler.ServeHTTP(rr, req)
+              }
+          }
+
+          func BenchmarkGetAvailableModels(b *testing.B) {
+              bc := &BedrockClient{
+                  availableModels: make([]ModelInfo, 100),
+              }
+              
+              // Fill with test data
+              for i := 0; i < 100; i++ {
+                  bc.availableModels[i] = ModelInfo{
+                      ID:        "model-" + string(rune(i)),
+                      Name:      "Model " + string(rune(i)),
+                      Available: i%2 == 0,
+                  }
+              }
+              
+              b.ResetTimer()
+              for i := 0; i < b.N; i++ {
+                  _ = bc.GetAvailableModels()
+              }
+          }
+          EOF
+
+      - name: Run tests with coverage
+        run: |
+          go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+          go tool cover -html=coverage.out -o coverage.html
+
+      - name: Run benchmarks
+        run: |
+          go test -bench=. -benchmem -count=3 ./... | tee benchmark-results.txt
+
+      - name: Check test coverage
+        run: |
+          COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
+          echo "Test coverage: ${COVERAGE}%"
+          
+          # Check if coverage is above threshold
+          if (( $(echo "$COVERAGE < 60" | bc -l) )); then
+            echo "⚠️ Coverage is below 60%"
+            exit 1
+          fi
+          echo "✅ Coverage is acceptable (${COVERAGE}%)"
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./bedrock-service/coverage.out
+          flags: bedrock-service
+          name: bedrock-service-coverage
+          fail_ci_if_error: false
+
+      - name: Upload test artifacts
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: test-results-${{ env.SERVICE_NAME }}-go${{ matrix.go-version }}
+          path: |
+            bedrock-service/coverage.out
+            bedrock-service/coverage.html
+            bedrock-service/benchmark-results.txt
+
+  # Build Docker Image
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: [lint, security, test]
+    if: github.event_name == 'push'
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=stable,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./bedrock-service
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ env.SERVICE_NAME }}
+          cache-to: type=gha,mode=max,scope=${{ env.SERVICE_NAME }}
+          platforms: linux/amd64,linux/arm64
+
+      - name: Generate build summary
+        run: |
+          echo "## 🐳 Docker Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Service**: ${{ env.SERVICE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: ${{ env.IMAGE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tags**: ${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Digest**: ${{ steps.build.outputs.digest }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Platforms**: linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
+
+  # Container Security Scan
+  container-security:
+    name: Container Security Scan
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.event_name == 'push'
+    
+    steps:
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # Trigger CD Pipeline
+  trigger-cd:
+    name: Trigger CD Pipeline
+    runs-on: ubuntu-latest
+    needs: [build, container-security]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    
+    steps:
+      - name: Trigger CD workflow
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const environment = '${{ github.ref }}' === 'refs/heads/main' ? 'production' : 'staging';
+            
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'bedrock-service-cd.yml',
+              ref: '${{ github.ref }}',
+              inputs: {
+                environment: environment,
+                image_tag: '${{ github.ref_name }}-${{ github.sha }}'
+              }
+            });
+
+  # Final Status
+  status:
+    name: CI Status
+    runs-on: ubuntu-latest
+    needs: [lint, security, test, build, container-security, trigger-cd]
+    if: always()
+    
+    steps:
+      - name: Check CI status
+        run: |
+          echo "## 🚀 CI Pipeline Results" >> $GITHUB_STEP_SUMMARY
+          echo "- **Lint**: ${{ needs.lint.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Security**: ${{ needs.security.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tests**: ${{ needs.test.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build**: ${{ needs.build.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Container Security**: ${{ needs.container-security.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **CD Trigger**: ${{ needs.trigger-cd.result }}" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ needs.lint.result }}" == "success" && "${{ needs.security.result }}" == "success" && "${{ needs.test.result }}" == "success" && "${{ needs.build.result }}" == "success" ]]; then
+            echo "✅ **All CI checks passed!**" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          else
+            echo "❌ **Some CI checks failed!**" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
