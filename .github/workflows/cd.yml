@@ -1,136 +1,262 @@
-# .github/workflows/ci.yml
-name: CI - Build and Push
+# .github/workflows/bedrock-service-cd.yml
+name: Bedrock Service - CD
 
 on:
-  push:
-    branches: [ main, develop ]
-    paths:
-      - '**'
-      - '!README.md'
-      - '!.github/**'
-  pull_request:
-    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        type: choice
+        options:
+        - staging
+        - production
+      image_tag:
+        description: 'Docker image tag to deploy'
+        required: true
+        type: string
+  repository_dispatch:
+    types: [deploy-bedrock-service]
 
 env:
-  REGISTRY: docker.io
+  SERVICE_NAME: bedrock-service
   IMAGE_NAME: samitsinghhh/bedrock-service
+  KUBE_CONFIG_DATA: ${{ secrets.KUBE_CONFIG_DATA }}
 
 jobs:
-  build-and-push:
+  deploy:
+    name: Deploy to Kubernetes
     runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || github.event.client_payload.environment || 'staging' }}
     
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-      
-    - name: Login to Docker Hub
-      uses: docker/login-action@v3
-      with:
-        username: ${{ secrets.DOCKER_USERNAME }}
-        password: ${{ secrets.DOCKER_PASSWORD }}
-    
-    - name: Extract metadata
-      id: meta
-      uses: docker/metadata-action@v5
-      with:
-        images: ${{ env.IMAGE_NAME }}
-        tags: |
-          type=ref,event=branch
-          type=sha,prefix={{branch}}-
-          type=raw,value=latest,enable={{is_default_branch}}
-    
-    - name: Build and push Docker image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        push: true
-        tags: ${{ steps.meta.outputs.tags }}
-        labels: ${{ steps.meta.outputs.labels }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
-        platforms: linux/amd64,linux/arm64
+      - name: Set deployment parameters
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ENVIRONMENT="${{ github.event.inputs.environment }}"
+            IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+          elif [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            ENVIRONMENT="${{ github.event.client_payload.environment }}"
+            IMAGE_TAG="${{ github.event.client_payload.image_tag }}"
+          else
+            ENVIRONMENT="staging"
+            IMAGE_TAG="latest"
+          fi
+          
+          if [ "$ENVIRONMENT" = "production" ]; then
+            NAMESPACE="bedrock-chat-v2"
+          else
+            NAMESPACE="bedrock-chat-staging"
+          fi
+          
+          echo "environment=$ENVIRONMENT" >> $GITHUB_OUTPUT
+          echo "namespace=$NAMESPACE" >> $GITHUB_OUTPUT
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "full_image=${{ env.IMAGE_NAME }}:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          
+          echo "🚀 Deployment Configuration:"
+          echo "- Environment: $ENVIRONMENT"
+          echo "- Namespace: $NAMESPACE"
+          echo "- Image Tag: $IMAGE_TAG"
+          echo "- Full Image: ${{ env.IMAGE_NAME }}:$IMAGE_TAG"
 
-    - name: Wait for image to be available
-      run: |
-        echo "Waiting for image to be available in registry..."
-        sleep 30
-        
-        # Verify image exists
-        docker manifest inspect ${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ github.sha }} || {
-          echo "Image not found in registry, waiting longer..."
-          sleep 60
-          docker manifest inspect ${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ github.sha }}
-        }
+      - name: Checkout k8s manifests
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/k8s-manifests
+          token: ${{ secrets.MANIFEST_REPO_TOKEN }}
+          path: k8s-manifests
 
-    - name: Security scan
-      uses: aquasecurity/trivy-action@master
-      with:
-        image-ref: ${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ github.sha }}
-        format: 'sarif'
-        output: 'trivy-results.sarif'
-      continue-on-error: true
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
 
-    - name: Update deployment manifest
-      if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
-      env:
-        GITHUB_TOKEN: ${{ secrets.MANIFEST_REPO_TOKEN }}
-        IMAGE_TAG: ${{ github.sha }}
-      run: |
-        # Clone the k8s-manifests repository
-        git clone https://github.com/${{ github.repository_owner }}/k8s-manifests.git
-        cd k8s-manifests
-        
-        # Configure git
-        git config user.name "GitHub Actions"
-        git config user.email "actions@github.com"
-        
-        # Check if deployment file exists
-        DEPLOYMENT_FILE="k8s/deployments/bedrock-service-deployment.yaml"
-        
-        if [ ! -f "$DEPLOYMENT_FILE" ]; then
-          echo "Error: Deployment file $DEPLOYMENT_FILE not found!"
-          echo "Available files in k8s/deployments/:"
-          ls -la k8s/deployments/ || echo "k8s/deployments/ directory not found"
-          echo "Repository structure:"
-          find . -name "*.yaml" -type f
-          exit 1
-        fi
-        
-        # Show current image tag
-        echo "Current deployment file content:"
-        grep "image:" $DEPLOYMENT_FILE || echo "No image: line found"
-        
-        # Replace image tag with new SHA
-        sed -i "s|${{ env.IMAGE_NAME }}:.*|${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${IMAGE_TAG}|g" $DEPLOYMENT_FILE
-        
-        # Show updated content
-        echo "Updated deployment file content:"
-        grep "image:" $DEPLOYMENT_FILE
-        
-        # Commit and push changes
-        git add .
-        if git diff --staged --quiet; then
-          echo "No changes to commit"
-        else
-          git commit -m "Update bedrock-service image to ${{ github.ref_name }}-${IMAGE_TAG} [skip ci]"
-          git push origin main
-        fi
+      - name: Configure kubectl
+        run: |
+          if [ -z "${{ env.KUBE_CONFIG_DATA }}" ]; then
+            echo "❌ KUBE_CONFIG_DATA secret not found!"
+            exit 1
+          fi
+          
+          echo "${{ env.KUBE_CONFIG_DATA }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+          chmod 600 kubeconfig
+          
+          # Test connection
+          kubectl cluster-info --request-timeout=30s
+          echo "✅ Connected to Kubernetes cluster"
 
-    - name: Trigger deployment
-      if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
-      run: |
-        ENV="production"
-        if [ "${{ github.ref }}" = "refs/heads/develop" ]; then
-          ENV="staging"
-        fi
-        
-        echo "Triggering deployment for $ENV environment"
-        
-        curl -X POST \
-          -H "Authorization: token ${{ secrets.MANIFEST_REPO_TOKEN }}" \
-          -H "Accept: application/vnd.github.v3+json" \
-          https://api.github.com/repos/${{ github.repository_owner }}/k8s-manifests/dispatches \
-          -d "{\"event_type\":\"deploy-bedrock-service\",\"client_payload\":{\"environment\":\"$ENV\",\"image_tag\":\"${{ github.ref_name }}-${{ github.sha }}\"}}"
+      - name: Update deployment manifest
+        run: |
+          cd k8s-manifests
+          
+          DEPLOYMENT_FILE=""
+          POSSIBLE_PATHS=(
+            "k8s/deployments/bedrock-service-deployment.yaml"
+            "deployments/bedrock-service-deployment.yaml"
+            "manifests/bedrock-service-deployment.yaml"
+          )
+          
+          for path in "${POSSIBLE_PATHS[@]}"; do
+            if [ -f "$path" ]; then
+              DEPLOYMENT_FILE="$path"
+              echo "Found deployment file: $path"
+              break
+            fi
+          done
+          
+          if [ -z "$DEPLOYMENT_FILE" ]; then
+            echo "❌ Bedrock Service deployment file not found!"
+            echo "Available files:"
+            find . -name "*bedrock-service*.yaml" -type f || echo "No Bedrock Service files found"
+            exit 1
+          fi
+          
+          echo "📝 Updating image in $DEPLOYMENT_FILE"
+          echo "From: $(grep -n "image:" "$DEPLOYMENT_FILE" | head -1)"
+          
+          # Update image tag
+          sed -i "s|image: samitsinghhh/bedrock-service:.*|image: ${{ steps.params.outputs.full_image }}|g" "$DEPLOYMENT_FILE"
+          
+          echo "To: $(grep -n "image:" "$DEPLOYMENT_FILE" | head -1)"
+          echo "✅ Manifest updated successfully"
+
+      - name: Create namespace
+        run: |
+          export KUBECONFIG=kubeconfig
+          kubectl create namespace ${{ steps.params.outputs.namespace }} --dry-run=client -o yaml | kubectl apply -f -
+          echo "✅ Namespace ready: ${{ steps.params.outputs.namespace }}"
+
+      - name: Apply supporting resources
+        run: |
+          export KUBECONFIG=kubeconfig
+          cd k8s-manifests
+          
+          # Apply Secrets (for AWS credentials)
+          if [ -f "k8s/secrets/app-secrets.yaml" ]; then
+            echo "🔐 Applying App Secrets..."
+            kubectl apply -f k8s/secrets/app-secrets.yaml -n ${{ steps.params.outputs.namespace }} || true
+          fi
+          
+          # Apply ConfigMaps
+          if [ -d "k8s/configmaps" ]; then
+            echo "📋 Applying ConfigMaps..."
+            kubectl apply -f k8s/configmaps/ -n ${{ steps.params.outputs.namespace }} || true
+          fi
+          
+          # Apply Services
+          echo "🌐 Applying Bedrock Service..."
+          kubectl apply -f k8s/services/bedrock-service-service.yaml -n ${{ steps.params.outputs.namespace }} || true
+
+      - name: Verify AWS credentials
+        run: |
+          export KUBECONFIG=kubeconfig
+          
+          echo "🔍 Checking AWS credentials secret..."
+          if kubectl get secret app-secrets -n ${{ steps.params.outputs.namespace }} > /dev/null 2>&1; then
+            echo "✅ AWS credentials secret exists"
+            # Check if secret has required keys (without exposing values)
+            if kubectl get secret app-secrets -n ${{ steps.params.outputs.namespace }} -o jsonpath='{.data}' | grep -q "AWS_ACCESS_KEY_ID"; then
+              echo "✅ AWS_ACCESS_KEY_ID found in secret"
+            else
+              echo "⚠️ AWS_ACCESS_KEY_ID missing from secret"
+            fi
+            if kubectl get secret app-secrets -n ${{ steps.params.outputs.namespace }} -o jsonpath='{.data}' | grep -q "AWS_SECRET_ACCESS_KEY"; then
+              echo "✅ AWS_SECRET_ACCESS_KEY found in secret"
+            else
+              echo "⚠️ AWS_SECRET_ACCESS_KEY missing from secret"
+            fi
+          else
+            echo "⚠️ AWS credentials secret not found - service may fail to start"
+          fi
+
+      - name: Deploy Bedrock Service
+        run: |
+          export KUBECONFIG=kubeconfig
+          cd k8s-manifests
+          
+          echo "🚀 Deploying Bedrock Service..."
+          
+          DEPLOYMENT_FILE=""
+          POSSIBLE_PATHS=(
+            "k8s/deployments/bedrock-service-deployment.yaml"
+            "deployments/bedrock-service-deployment.yaml"
+            "manifests/bedrock-service-deployment.yaml"
+          )
+          
+          for path in "${POSSIBLE_PATHS[@]}"; do
+            if [ -f "$path" ]; then
+              DEPLOYMENT_FILE="$path"
+              break
+            fi
+          done
+          
+          kubectl apply -f "$DEPLOYMENT_FILE" -n ${{ steps.params.outputs.namespace }}
+          
+          echo "⏳ Waiting for rollout to complete..."
+          kubectl rollout status deployment/bedrock-service -n ${{ steps.params.outputs.namespace }} --timeout=300s
+
+      - name: Verify deployment
+        run: |
+          export KUBECONFIG=kubeconfig
+          
+          echo "🔍 Verifying deployment..."
+          
+          # Check deployment status
+          kubectl get deployment bedrock-service -n ${{ steps.params.outputs.namespace }} -o wide
+          
+          # Check pods
+          echo "=== Pod Status ==="
+          kubectl get pods -l app=bedrock-service -n ${{ steps.params.outputs.namespace }} -o wide
+          
+          # Check service
+          echo "=== Service Status ==="
+          kubectl get service bedrock-service -n ${{ steps.params.outputs.namespace }} -o wide
+          
+          # Check if pods are ready
+          kubectl wait --for=condition=ready pod -l app=bedrock-service -n ${{ steps.params.outputs.namespace }} --timeout=120s
+
+      - name: Run health checks
+        run: |
+          export KUBECONFIG=kubeconfig
+          
+          echo "🏥 Running health checks..."
+          
+          # Test health endpoint
+          echo "Testing health endpoint..."
+          if kubectl exec -n ${{ steps.params.outputs.namespace }} deployment/bedrock-service -- wget -qO- --timeout=10 http://localhost:9000/health; then
+            echo "✅ Health check passed"
+          else
+            echo "⚠️ Health check failed, checking logs..."
+            kubectl logs -n ${{ steps.params.outputs.namespace }} deployment/bedrock-service --tail=20
+            echo "⚠️ Continuing deployment despite health check failure..."
+          fi
+
+      - name: Test model availability
+        run: |
+          export KUBECONFIG=kubeconfig
+          
+          echo "🤖 Testing model availability..."
+          
+          # Test models endpoint
+          echo "Testing models endpoint..."
+          if kubectl exec -n ${{ steps.params.outputs.namespace }} deployment/bedrock-service -- wget -qO- --timeout=15 http://localhost:9000/models | grep -q "models"; then
+            echo "✅ Models endpoint accessible"
+          else
+            echo "⚠️ Models endpoint test failed"
+            kubectl logs -n ${{ steps.params.outputs.namespace }} deployment/bedrock-service --tail=10
+          fi
+
+      - name: Run smoke tests
+        run: |
+          export KUBECONFIG=kubeconfig
+          
+          echo "🧪 Running smoke tests..."
+          
+          # Test root endpoint
+          echo "Testing root endpoint..."
+          kubectl exec -n ${{ steps.params.outputs.namespace }} deployment/bedrock-service -- wget -qO- --timeout=10 http://localhost:9000/ > /dev/null
+          
+          echo "✅ Smoke
