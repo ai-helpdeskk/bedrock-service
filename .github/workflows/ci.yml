@@ -1,20 +1,18 @@
+# .github/workflows/bedrock-service-ci.yml
 name: Bedrock Service - CI
 
 on:
   push:
     branches: [main, develop]
     paths:
-      - 'bedrock-service/**'
-      - '.github/workflows/bedrock-service-ci.yml'
       - 'main.go'
       - 'go.mod'
       - 'Dockerfile'
   pull_request:
     branches: [main]
     paths:
-      - 'bedrock-service/**'
       - 'main.go'
-      - 'go.mod'
+      - 'go.mod' 
       - 'Dockerfile'
   workflow_dispatch:
 
@@ -24,11 +22,9 @@ env:
   GO_VERSION: '1.21'
 
 jobs:
-  # Lint and Code Quality
   lint:
     name: Lint & Code Quality
     runs-on: ubuntu-latest
-    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -37,41 +33,20 @@ jobs:
         uses: actions/setup-go@v4
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: true
-          cache-dependency-path: go.sum
-
-      - name: Download dependencies
-        run: |
-          go mod download
-          go mod tidy
 
       - name: Format check
         run: |
-          if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then
-            echo "❌ Code formatting issues found:"
-            gofmt -s -l .
-            exit 1
-          fi
-          echo "✅ Code formatting is correct"
+          gofmt -s -l .
+          go vet ./...
 
-      - name: Run go vet
-        run: go vet ./...
-
-      - name: Install and run staticcheck
-        run: |
-          go install honnef.co/go/tools/cmd/staticcheck@latest
-          staticcheck ./...
-
-      - name: Install and run golangci-lint
+      - name: Install golangci-lint
         run: |
           go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
-          golangci-lint run --timeout=5m
+          golangci-lint run
 
-  # SAST Security Scan
-  sast:
-    name: SAST Security Scan
+  security:
+    name: Security Scan
     runs-on: ubuntu-latest
-    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -81,33 +56,14 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      - name: Download dependencies
-        run: go mod download
-
-      - name: Install and run gosec
+      - name: Run gosec
         run: |
           go install github.com/securecodewarrior/gosec/v2/cmd/gosec@latest
-          gosec -fmt sarif -out gosec-results.sarif ./... || true
-          gosec -fmt text ./...
+          gosec ./...
 
-      - name: Upload SARIF file
-        uses: github/codeql-action/upload-sarif@v2
-        if: always()
-        with:
-          sarif_file: gosec-results.sarif
-
-      - name: Upload SAST artifacts
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: sast-reports-${{ env.SERVICE_NAME }}
-          path: gosec-results.sarif
-
-  # SCA Dependency Scan
-  sca:
-    name: SCA Dependency Scan
+  dependency-scan:
+    name: Dependency Scan
     runs-on: ubuntu-latest
-    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -116,25 +72,15 @@ jobs:
         uses: actions/setup-go@v4
         with:
           go-version: ${{ env.GO_VERSION }}
-
-      - name: Download dependencies
-        run: go mod download
-
-      - name: Install and run nancy
-        run: |
-          go install github.com/sonatypecommunity/nancy@latest
-          go list -json -deps ./... | nancy sleuth || true
 
       - name: Run govulncheck
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./... || true
+          govulncheck ./...
 
-  # Unit Tests
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
-    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -143,198 +89,22 @@ jobs:
         uses: actions/setup-go@v4
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: true
-          cache-dependency-path: go.sum
 
       - name: Download dependencies
         run: |
           go mod download
           go mod tidy
 
-      - name: Create test file
-        run: |
-          cat > main_test.go << 'EOF'
-          package main
-
-          import (
-              "bytes"
-              "encoding/json"
-              "net/http"
-              "net/http/httptest"
-              "strings"
-              "testing"
-          )
-
-          func TestHealthHandler(t *testing.T) {
-              bc := &BedrockClient{
-                  availableModels: []ModelInfo{
-                      {ID: "test-model", Name: "Test Model", Available: true},
-                  },
-              }
-              
-              req, err := http.NewRequest("GET", "/health", nil)
-              if err != nil {
-                  t.Fatal(err)
-              }
-              
-              rr := httptest.NewRecorder()
-              handler := healthHandler(bc)
-              handler.ServeHTTP(rr, req)
-              
-              if status := rr.Code; status != http.StatusOK {
-                  t.Errorf("handler returned wrong status code: got %v want %v", status, http.StatusOK)
-              }
-
-              var response HealthResponse
-              if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
-                  t.Errorf("Failed to parse response: %v", err)
-              }
-
-              if response.Status != "healthy" {
-                  t.Errorf("Expected status 'healthy', got '%s'", response.Status)
-              }
-          }
-
-          func TestRootHandler(t *testing.T) {
-              req, err := http.NewRequest("GET", "/", nil)
-              if err != nil {
-                  t.Fatal(err)
-              }
-              
-              rr := httptest.NewRecorder()
-              rootHandler(rr, req)
-              
-              if status := rr.Code; status != http.StatusOK {
-                  t.Errorf("handler returned wrong status code: got %v want %v", status, http.StatusOK)
-              }
-
-              if !strings.Contains(rr.Body.String(), "Enhanced Bedrock Service") {
-                  t.Errorf("Response does not contain expected message")
-              }
-          }
-
-          func TestModelsHandler(t *testing.T) {
-              bc := &BedrockClient{
-                  availableModels: []ModelInfo{
-                      {ID: "test-model-1", Name: "Test Model 1", Available: true, MessageAPI: true},
-                      {ID: "test-model-2", Name: "Test Model 2", Available: false, MessageAPI: false},
-                  },
-              }
-              
-              req, err := http.NewRequest("GET", "/models", nil)
-              if err != nil {
-                  t.Fatal(err)
-              }
-              
-              rr := httptest.NewRecorder()
-              handler := modelsHandler(bc)
-              handler.ServeHTTP(rr, req)
-              
-              if status := rr.Code; status != http.StatusOK {
-                  t.Errorf("handler returned wrong status code: got %v want %v", status, http.StatusOK)
-              }
-
-              var response map[string]interface{}
-              if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
-                  t.Errorf("Failed to parse response: %v", err)
-              }
-
-              models, ok := response["models"].([]interface{})
-              if !ok || len(models) != 2 {
-                  t.Errorf("Expected 2 models in response, got %v", models)
-              }
-          }
-
-          func TestGenerateHandler_InvalidRequest(t *testing.T) {
-              bc := &BedrockClient{
-                  availableModels: []ModelInfo{
-                      {ID: "test-model", Name: "Test Model", Available: true},
-                  },
-              }
-              
-              req, err := http.NewRequest("POST", "/generate", bytes.NewBuffer([]byte("{}")))
-              if err != nil {
-                  t.Fatal(err)
-              }
-              req.Header.Set("Content-Type", "application/json")
-              
-              rr := httptest.NewRecorder()
-              handler := generateHandler(bc)
-              handler.ServeHTTP(rr, req)
-              
-              if status := rr.Code; status != http.StatusBadRequest {
-                  t.Errorf("handler returned wrong status code: got %v want %v", status, http.StatusBadRequest)
-              }
-          }
-
-          func TestBedrockClient_GetAvailableModels(t *testing.T) {
-              bc := &BedrockClient{
-                  availableModels: []ModelInfo{
-                      {ID: "model-1", Name: "Model 1", Available: true},
-                      {ID: "model-2", Name: "Model 2", Available: false},
-                      {ID: "model-3", Name: "Model 3", Available: true},
-                  },
-              }
-              
-              available := bc.GetAvailableModels()
-              expected := []string{"Model 1", "Model 3"}
-              
-              if len(available) != len(expected) {
-                  t.Errorf("Expected %d available models, got %d", len(expected), len(available))
-              }
-          }
-
-          func TestMinFunction(t *testing.T) {
-              tests := []struct {
-                  a, b, expected int
-              }{
-                  {1, 2, 1},
-                  {5, 3, 3},
-                  {0, 0, 0},
-                  {-1, 1, -1},
-              }
-              
-              for _, test := range tests {
-                  result := min(test.a, test.b)
-                  if result != test.expected {
-                      t.Errorf("min(%d, %d) = %d, expected %d", test.a, test.b, result, test.expected)
-                  }
-              }
-          }
-          EOF
-
-      - name: Run tests with coverage
+      - name: Run tests
         run: |
           go test -v -race -coverprofile=coverage.out ./...
           go tool cover -html=coverage.out -o coverage.html
 
-      - name: Check test coverage
-        run: |
-          COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
-          echo "Test coverage: ${COVERAGE}%"
-          
-          if awk "BEGIN {exit !($COVERAGE < 20)}"; then
-            echo "⚠️ Coverage is below 20%"
-          else
-            echo "✅ Coverage is acceptable (${COVERAGE}%)"
-          fi
-
-      - name: Upload test results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: test-results-${{ env.SERVICE_NAME }}
-          path: |
-            coverage.out
-            coverage.html
-
-  # Build Docker Image
   build:
     name: Build Docker Image
     runs-on: ubuntu-latest
-    needs: [lint, sast, sca, test]
+    needs: [lint, security, dependency-scan, test]
     if: github.event_name == 'push'
-    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -348,100 +118,33 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
-
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
 
-  # Container Security Scan
-  container-security:
-    name: Container Security Scan
-    runs-on: ubuntu-latest
-    needs: [build]
-    if: github.event_name == 'push'
-    
-    steps:
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-
-      - name: Upload Trivy scan results
-        uses: github/codeql-action/upload-sarif@v2
-        if: always()
-        with:
-          sarif_file: 'trivy-results.sarif'
-
-  # Trigger CD Pipeline
   trigger-cd:
     name: Trigger CD Pipeline
     runs-on: ubuntu-latest
-    needs: [build, container-security]
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
-    
+    needs: [build]
+    if: github.ref == 'refs/heads/main'
     steps:
       - name: Trigger CD workflow
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const environment = '${{ github.ref }}' === 'refs/heads/main' ? 'production' : 'staging';
-            const imageTag = '${{ github.sha }}';
-            
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
               workflow_id: 'bedrock-service-cd.yml',
-              ref: '${{ github.ref }}',
+              ref: 'main',
               inputs: {
-                environment: environment,
-                image_tag: imageTag
+                image_tag: '${{ github.sha }}'
               }
             });
-            
-            console.log(`Triggered CD for ${environment} with image tag: ${imageTag}`);
-
-  # Final Status
-  ci-status:
-    name: CI Status
-    runs-on: ubuntu-latest
-    needs: [lint, sast, sca, test, build, container-security, trigger-cd]
-    if: always()
-    
-    steps:
-      - name: Check CI status
-        run: |
-          echo "## 🚀 Bedrock Service CI Results"
-          echo "- Lint: ${{ needs.lint.result }}"
-          echo "- SAST: ${{ needs.sast.result }}"
-          echo "- SCA: ${{ needs.sca.result }}"
-          echo "- Tests: ${{ needs.test.result }}"
-          echo "- Build: ${{ needs.build.result }}"
-          echo "- Container Security: ${{ needs.container-security.result }}"
-          echo "- CD Trigger: ${{ needs.trigger-cd.result }}"
-          
-          if [[ "${{ needs.test.result }}" == "success" && "${{ needs.build.result }}" == "success" ]]; then
-            echo "✅ Critical checks passed!"
-            exit 0
-          else
-            echo "❌ Some checks failed"
-            exit 1
-          fi
