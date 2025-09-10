@@ -259,4 +259,67 @@ jobs:
           echo "Testing root endpoint..."
           kubectl exec -n ${{ steps.params.outputs.namespace }} deployment/bedrock-service -- wget -qO- --timeout=10 http://localhost:9000/ > /dev/null
           
-          echo "✅ Smoke
+          echo "✅ Smoke tests passed"
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          export KUBECONFIG=kubeconfig
+          
+          echo "## 🚀 Bedrock Service Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Service**: ${{ env.SERVICE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: ${{ steps.params.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Namespace**: ${{ steps.params.outputs.namespace }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: ${{ steps.params.outputs.full_image }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✅ **Deployment successful!**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 📊 Deployment Status" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            kubectl get pods -l app=bedrock-service -n ${{ steps.params.outputs.namespace }} >> $GITHUB_STEP_SUMMARY 2>&1 || true
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Deployment failed!**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 🔍 Troubleshooting Info" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            kubectl get events -n ${{ steps.params.outputs.namespace }} --sort-by='.lastTimestamp' | tail -10 >> $GITHUB_STEP_SUMMARY 2>&1 || true
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # Rollback capability
+  rollback:
+    name: Rollback (Manual)
+    runs-on: ubuntu-latest
+    if: failure() && github.event.inputs.environment
+    environment: ${{ github.event.inputs.environment }}
+    
+    steps:
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure kubectl
+        run: |
+          echo "${{ env.KUBE_CONFIG_DATA }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+          chmod 600 kubeconfig
+
+      - name: Rollback deployment
+        run: |
+          export KUBECONFIG=kubeconfig
+          
+          NAMESPACE="${{ github.event.inputs.environment == 'production' && 'bedrock-chat-v2' || 'bedrock-chat-staging' }}"
+          
+          echo "🔄 Rolling back Bedrock Service deployment..."
+          kubectl rollout undo deployment/bedrock-service -n $NAMESPACE
+          
+          echo "⏳ Waiting for rollback to complete..."
+          kubectl rollout status deployment/bedrock-service -n $NAMESPACE --timeout=180s
+          
+          echo "✅ Rollback completed"
