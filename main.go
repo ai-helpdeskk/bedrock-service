@@ -41,7 +41,7 @@ type ModelInfo struct {
     ID          string
     Name        string
     Available   bool
-    MessageAPI  bool // Uses new message API format
+    MessageAPI  bool
 }
 
 // BedrockClient wraps the AWS Bedrock client
@@ -50,18 +50,20 @@ type BedrockClient struct {
     availableModels []ModelInfo
 }
 
-// NewBedrockClient creates a new Bedrock client
+// NewBedrockClient creates a new Bedrock client with improved error handling
 func NewBedrockClient() (*BedrockClient, error) {
-    // Get AWS credentials from environment variables
     awsAccessKey := os.Getenv("AWS_ACCESS_KEY_ID")
     awsSecretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
     awsRegion := os.Getenv("AWS_REGION")
     
     if awsRegion == "" {
-        awsRegion = "us-east-1" // Default region
+        awsRegion = "us-east-1"
     }
 
-    // Create AWS config
+    if awsAccessKey == "" || awsSecretKey == "" {
+        return nil, fmt.Errorf("AWS credentials not provided")
+    }
+
     cfg, err := config.LoadDefaultConfig(context.TODO(),
         config.WithRegion(awsRegion),
         config.WithCredentialsProvider(
@@ -72,25 +74,16 @@ func NewBedrockClient() (*BedrockClient, error) {
         return nil, fmt.Errorf("unable to load SDK config: %v", err)
     }
 
-    // Create Bedrock client
     client := bedrockruntime.NewFromConfig(cfg)
     
-    // Define available models with enhanced context handling
     availableModels := []ModelInfo{
-        // Claude 3.5 models (best for conversation memory)
         {ID: "anthropic.claude-3-5-sonnet-20241022-v2:0", Name: "Claude 3.5 Sonnet v2", MessageAPI: true},
         {ID: "anthropic.claude-3-5-sonnet-20240620-v1:0", Name: "Claude 3.5 Sonnet", MessageAPI: true},
         {ID: "anthropic.claude-3-5-haiku-20241022-v1:0", Name: "Claude 3.5 Haiku", MessageAPI: true},
-        
-        // Claude 3 models
         {ID: "anthropic.claude-3-sonnet-20240229-v1:0", Name: "Claude 3 Sonnet", MessageAPI: true},
         {ID: "anthropic.claude-3-haiku-20240307-v1:0", Name: "Claude 3 Haiku", MessageAPI: true},
-        {ID: "anthropic.claude-3-opus-20240229-v1:0", Name: "Claude 3 Opus", MessageAPI: true},
-        
-        // Older Claude models (fallback)
         {ID: "anthropic.claude-v2:1", Name: "Claude v2.1", MessageAPI: false},
         {ID: "anthropic.claude-v2", Name: "Claude v2", MessageAPI: false},
-        {ID: "anthropic.claude-instant-v1", Name: "Claude Instant", MessageAPI: false},
     }
     
     return &BedrockClient{
@@ -111,7 +104,6 @@ func (bc *BedrockClient) TestModelAvailability() {
         var requestBody map[string]interface{}
         
         if model.MessageAPI {
-            // New message API format for Claude 3+ models
             requestBody = map[string]interface{}{
                 "anthropic_version": "bedrock-2023-05-31",
                 "max_tokens": 10,
@@ -123,7 +115,6 @@ func (bc *BedrockClient) TestModelAvailability() {
                 },
             }
         } else {
-            // Legacy format for Claude v2 and earlier
             requestBody = map[string]interface{}{
                 "prompt": fmt.Sprintf("\n\nHuman: %s\n\nAssistant:", testPrompt),
                 "max_tokens_to_sample": 10,
@@ -132,11 +123,13 @@ func (bc *BedrockClient) TestModelAvailability() {
 
         bodyBytes, _ := json.Marshal(requestBody)
         
-        _, err := bc.client.InvokeModel(context.TODO(), &bedrockruntime.InvokeModelInput{
+        ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+        _, err := bc.client.InvokeModel(ctx, &bedrockruntime.InvokeModelInput{
             Body:        bodyBytes,
             ModelId:     aws.String(model.ID),
             ContentType: aws.String("application/json"),
         })
+        cancel()
         
         if err != nil {
             log.Printf("Model %s (%s): UNAVAILABLE - %v", model.Name, model.ID, err)
@@ -161,15 +154,13 @@ func (bc *BedrockClient) GetAvailableModels() []string {
 
 // GenerateText calls Amazon Bedrock with enhanced context handling
 func (bc *BedrockClient) GenerateText(prompt string, preferredModel string, maxTokens int, temperature float64) (string, string, error) {
-    // Set defaults
     if maxTokens == 0 {
-        maxTokens = 2000 // Increased for better responses with context
+        maxTokens = 2000
     }
     if temperature == 0 {
         temperature = 0.7
     }
 
-    // Find preferred model if specified
     var modelsToTry []ModelInfo
     if preferredModel != "" {
         for _, model := range bc.availableModels {
@@ -181,10 +172,8 @@ func (bc *BedrockClient) GenerateText(prompt string, preferredModel string, maxT
         }
     }
     
-    // Add all available models as fallback
     for _, model := range bc.availableModels {
         if model.Available {
-            // Check if already added
             found := false
             for _, existing := range modelsToTry {
                 if existing.ID == model.ID {
@@ -209,7 +198,6 @@ func (bc *BedrockClient) GenerateText(prompt string, preferredModel string, maxT
         var requestBody map[string]interface{}
         
         if model.MessageAPI {
-            // Enhanced system prompt for better context understanding
             systemPrompt := "You are a helpful AI assistant with access to conversation history and uploaded files. " +
                            "When responding, consider the full context provided, including previous conversations and any file content. " +
                            "If file content is mentioned in the context, analyze and reference it appropriately in your response. " +
@@ -228,7 +216,6 @@ func (bc *BedrockClient) GenerateText(prompt string, preferredModel string, maxT
                 "temperature": temperature,
             }
         } else {
-            // Enhanced legacy format with better context handling
             enhancedPrompt := fmt.Sprintf("\n\nHuman: You are a helpful AI assistant with conversation memory and file analysis capabilities. Please provide thoughtful, contextual responses based on the information provided.\n\n%s\n\nAssistant:", prompt)
             
             requestBody = map[string]interface{}{
@@ -244,12 +231,13 @@ func (bc *BedrockClient) GenerateText(prompt string, preferredModel string, maxT
             continue
         }
 
-        // Invoke the model
-        resp, err := bc.client.InvokeModel(context.TODO(), &bedrockruntime.InvokeModelInput{
+        ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+        resp, err := bc.client.InvokeModel(ctx, &bedrockruntime.InvokeModelInput{
             Body:        bodyBytes,
             ModelId:     aws.String(model.ID),
             ContentType: aws.String("application/json"),
         })
+        cancel()
         
         if err != nil {
             lastError = err
@@ -257,16 +245,13 @@ func (bc *BedrockClient) GenerateText(prompt string, preferredModel string, maxT
             continue
         }
 
-        // Parse the response
         var response map[string]interface{}
         if err := json.Unmarshal(resp.Body, &response); err != nil {
             lastError = fmt.Errorf("error parsing response: %v", err)
             continue
         }
 
-        // Extract text based on API format
         if model.MessageAPI {
-            // New message API format
             if content, ok := response["content"].([]interface{}); ok && len(content) > 0 {
                 if firstContent, ok := content[0].(map[string]interface{}); ok {
                     if text, ok := firstContent["text"].(string); ok {
@@ -276,7 +261,6 @@ func (bc *BedrockClient) GenerateText(prompt string, preferredModel string, maxT
                 }
             }
         } else {
-            // Legacy format
             if completion, ok := response["completion"].(string); ok {
                 log.Printf("✓ Successfully used model: %s", model.Name)
                 return completion, model.Name, nil
@@ -289,7 +273,7 @@ func (bc *BedrockClient) GenerateText(prompt string, preferredModel string, maxT
     return "", "", fmt.Errorf("all available models failed. Last error: %v", lastError)
 }
 
-// Handlers
+// HTTP Handlers
 func healthHandler(bc *BedrockClient) http.HandlerFunc {
     return func(w http.ResponseWriter, r *http.Request) {
         response := HealthResponse{
@@ -305,7 +289,7 @@ func healthHandler(bc *BedrockClient) http.HandlerFunc {
 func rootHandler(w http.ResponseWriter, r *http.Request) {
     response := map[string]string{
         "message": "Enhanced Bedrock Service is running",
-        "version": "3.0.0",
+        "version": "4.0.0",
         "features": "conversation-context, file-analysis, multi-model-support",
         "documentation": "POST /generate with {\"prompt\": \"your prompt with context\", \"model\": \"optional model preference\"}",
     }
@@ -317,13 +301,11 @@ func generateHandler(bc *BedrockClient) http.HandlerFunc {
     return func(w http.ResponseWriter, r *http.Request) {
         var req GenerateRequest
         
-        // Parse request body
         if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
             http.Error(w, "Invalid request body", http.StatusBadRequest)
             return
         }
 
-        // Validate prompt
         if req.Prompt == "" {
             http.Error(w, "Prompt is required", http.StatusBadRequest)
             return
@@ -332,7 +314,6 @@ func generateHandler(bc *BedrockClient) http.HandlerFunc {
         log.Printf("Received enhanced prompt: %s (model preference: %s)", 
             req.Prompt[:min(100, len(req.Prompt))], req.Model)
 
-        // Generate text using Bedrock with enhanced context
         response, modelUsed, err := bc.GenerateText(req.Prompt, req.Model, req.MaxTokens, req.Temperature)
         if err != nil {
             log.Printf("Error generating text: %v", err)
@@ -340,7 +321,6 @@ func generateHandler(bc *BedrockClient) http.HandlerFunc {
             return
         }
 
-        // Send response
         w.Header().Set("Content-Type", "application/json")
         json.NewEncoder(w).Encode(GenerateResponse{
             Response:  response,
@@ -358,7 +338,6 @@ func modelsHandler(bc *BedrockClient) http.HandlerFunc {
                 "name":      model.Name,
                 "available": model.Available,
                 "api_type":  map[bool]string{true: "messages", false: "legacy"}[model.MessageAPI],
-                "features":  []string{"conversation-context", "file-analysis"},
             })
         }
         
@@ -377,36 +356,30 @@ func min(a, b int) int {
 }
 
 func main() {
-    log.Println("Starting Enhanced Bedrock Service v3.0...")
+    log.Println("Starting Enhanced Bedrock Service v4.0...")
     
-    // Initialize Bedrock client
     bc, err := NewBedrockClient()
     if err != nil {
         log.Fatalf("Failed to initialize Bedrock client: %v", err)
     }
 
-    // Test model availability
     bc.TestModelAvailability()
 
-    // Create router
     router := mux.NewRouter()
     
-    // Register routes
     router.HandleFunc("/", rootHandler).Methods("GET")
     router.HandleFunc("/health", healthHandler(bc)).Methods("GET")
     router.HandleFunc("/models", modelsHandler(bc)).Methods("GET")
     router.HandleFunc("/generate", generateHandler(bc)).Methods("POST")
 
-    // Configure server with enhanced timeouts for context processing
     srv := &http.Server{
         Handler:      router,
         Addr:         ":9000",
-        WriteTimeout: 120 * time.Second,  // Increased for context processing
-        ReadTimeout:  60 * time.Second,   // Increased for large context
+        WriteTimeout: 120 * time.Second,
+        ReadTimeout:  60 * time.Second,
     }
 
     log.Printf("Enhanced Bedrock Service started on port 9000 with %d available models", len(bc.GetAvailableModels()))
-    log.Println("Features: Conversation Context, File Analysis, Multi-Model Support")
     
     if err := srv.ListenAndServe(); err != nil {
         log.Fatal(err)
