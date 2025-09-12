@@ -17,7 +17,6 @@ import (
     "github.com/gorilla/mux"
 )
 
-// Request and Response structs
 type GenerateRequest struct {
     Prompt      string  `json:"prompt"`
     MaxTokens   int     `json:"max_tokens,omitempty"`
@@ -44,13 +43,11 @@ type ModelInfo struct {
     MessageAPI  bool
 }
 
-// BedrockClient wraps the AWS Bedrock client
 type BedrockClient struct {
     client         *bedrockruntime.Client
     availableModels []ModelInfo
 }
 
-// NewBedrockClient creates a new Bedrock client with improved error handling
 func NewBedrockClient() (*BedrockClient, error) {
     awsAccessKey := os.Getenv("AWS_ACCESS_KEY_ID")
     awsSecretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
@@ -92,7 +89,6 @@ func NewBedrockClient() (*BedrockClient, error) {
     }, nil
 }
 
-// TestModelAvailability tests which models are actually available
 func (bc *BedrockClient) TestModelAvailability() {
     log.Println("Testing model availability...")
     
@@ -141,7 +137,6 @@ func (bc *BedrockClient) TestModelAvailability() {
     }
 }
 
-// GetAvailableModels returns list of available model names
 func (bc *BedrockClient) GetAvailableModels() []string {
     var available []string
     for _, model := range bc.availableModels {
@@ -152,7 +147,6 @@ func (bc *BedrockClient) GetAvailableModels() []string {
     return available
 }
 
-// GenerateText calls Amazon Bedrock with enhanced context handling
 func (bc *BedrockClient) GenerateText(prompt string, preferredModel string, maxTokens int, temperature float64) (string, string, error) {
     if maxTokens == 0 {
         maxTokens = 2000
@@ -273,7 +267,6 @@ func (bc *BedrockClient) GenerateText(prompt string, preferredModel string, maxT
     return "", "", fmt.Errorf("all available models failed. Last error: %v", lastError)
 }
 
-// HTTP Handlers
 func healthHandler(bc *BedrockClient) http.HandlerFunc {
     return func(w http.ResponseWriter, r *http.Request) {
         response := HealthResponse{
@@ -288,10 +281,9 @@ func healthHandler(bc *BedrockClient) http.HandlerFunc {
 
 func rootHandler(w http.ResponseWriter, r *http.Request) {
     response := map[string]string{
-        "message": "Enhanced Bedrock Service is running",
-        "version": "4.0.0",
+        "message": "Bedrock Service is running",
+        "version": "1.0.0",
         "features": "conversation-context, file-analysis, multi-model-support",
-        "documentation": "POST /generate with {\"prompt\": \"your prompt with context\", \"model\": \"optional model preference\"}",
     }
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(response)
@@ -311,8 +303,7 @@ func generateHandler(bc *BedrockClient) http.HandlerFunc {
             return
         }
 
-        log.Printf("Received enhanced prompt: %s (model preference: %s)", 
-            req.Prompt[:min(100, len(req.Prompt))], req.Model)
+        log.Printf("Received prompt: %s", req.Prompt[:min(100, len(req.Prompt))])
 
         response, modelUsed, err := bc.GenerateText(req.Prompt, req.Model, req.MaxTokens, req.Temperature)
         if err != nil {
@@ -329,25 +320,6 @@ func generateHandler(bc *BedrockClient) http.HandlerFunc {
     }
 }
 
-func modelsHandler(bc *BedrockClient) http.HandlerFunc {
-    return func(w http.ResponseWriter, r *http.Request) {
-        models := make([]map[string]interface{}, 0)
-        for _, model := range bc.availableModels {
-            models = append(models, map[string]interface{}{
-                "id":        model.ID,
-                "name":      model.Name,
-                "available": model.Available,
-                "api_type":  map[bool]string{true: "messages", false: "legacy"}[model.MessageAPI],
-            })
-        }
-        
-        w.Header().Set("Content-Type", "application/json")
-        json.NewEncoder(w).Encode(map[string]interface{}{
-            "models": models,
-        })
-    }
-}
-
 func min(a, b int) int {
     if a < b {
         return a
@@ -356,7 +328,7 @@ func min(a, b int) int {
 }
 
 func main() {
-    log.Println("Starting Enhanced Bedrock Service v4.0...")
+    log.Println("Starting Bedrock Service...")
     
     bc, err := NewBedrockClient()
     if err != nil {
@@ -369,7 +341,6 @@ func main() {
     
     router.HandleFunc("/", rootHandler).Methods("GET")
     router.HandleFunc("/health", healthHandler(bc)).Methods("GET")
-    router.HandleFunc("/models", modelsHandler(bc)).Methods("GET")
     router.HandleFunc("/generate", generateHandler(bc)).Methods("POST")
 
     srv := &http.Server{
@@ -379,7 +350,7 @@ func main() {
         ReadTimeout:  60 * time.Second,
     }
 
-    log.Printf("Enhanced Bedrock Service started on port 9000 with %d available models", len(bc.GetAvailableModels()))
+    log.Printf("Bedrock Service started on port 9000")
     
     if err := srv.ListenAndServe(); err != nil {
         log.Fatal(err)
