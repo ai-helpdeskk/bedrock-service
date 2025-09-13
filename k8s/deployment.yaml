@@ -2,11 +2,11 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: bedrock-service
-  namespace: bedrock-chat
+  namespace: bedrock-chat-v2
   labels:
     app: bedrock-service
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: bedrock-service
@@ -15,49 +15,62 @@ spec:
       labels:
         app: bedrock-service
     spec:
+      imagePullSecrets:
+        - name: docker-hub-secret
       containers:
-      - name: bedrock-service
-        image: ghcr.io/your-org/bedrock-chat-bedrock-service:latest
-        imagePullPolicy: Always
-        ports:
-        - containerPort: 9000
-          name: http
-        env:
-        - name: AWS_ACCESS_KEY_ID
-          valueFrom:
-            secretKeyRef:
-              name: aws-secrets
-              key: AWS_ACCESS_KEY_ID
-        - name: AWS_SECRET_ACCESS_KEY
-          valueFrom:
-            secretKeyRef:
-              name: aws-secrets
-              key: AWS_SECRET_ACCESS_KEY
-        - name: AWS_REGION
-          value: "us-east-1"
-        startupProbe:
-          httpGet:
-            path: /health
-            port: 9000
-          initialDelaySeconds: 30
-          periodSeconds: 15
-          failureThreshold: 10
-        livenessProbe:
-          httpGet:
-            path: /health
-            port: 9000
-          initialDelaySeconds: 60
-          periodSeconds: 30
-        readinessProbe:
-          httpGet:
-            path: /health
-            port: 9000
-          initialDelaySeconds: 20
-          periodSeconds: 10
-        resources:
-          requests:
-            memory: "512Mi"
-            cpu: "200m"
-          limits:
-            memory: "1Gi"
-            cpu: "500m"
+        - name: bedrock-service
+          image: samitsinghhh/bedrock-service:v3
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 9000
+              name: http
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: AWS_REGION
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 9000
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            timeoutSeconds: 15
+            successThreshold: 1
+            failureThreshold: 15
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9000
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            timeoutSeconds: 15
+            successThreshold: 1
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9000
+            initialDelaySeconds: 90
+            periodSeconds: 15
+            timeoutSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "384Mi"
+              cpu: "200m"
