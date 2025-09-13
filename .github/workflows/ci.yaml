@@ -27,19 +27,19 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
-    
+
     - name: Setup Go
       uses: actions/setup-go@v5
       with:
         go-version: '1.21'
         cache: true
-    
+
     - name: Install dependencies
       run: |
         cd bedrock-service
         go mod download
         go mod tidy
-    
+
     - name: CI Linting 🧹
       run: |
         cd bedrock-service
@@ -49,33 +49,33 @@ jobs:
           exit 1
         fi
         echo "✅ Linting passed"
-    
+
     - name: Static Code Analysis 🔍
       run: |
         cd bedrock-service
         go vet ./...
         if [ $? -eq 0 ]; then echo "✅ Code analysis passed"; else echo "❌ Code analysis failed" && exit 1; fi
-    
+
     - name: Software Component Analysis (SCA) 📦
       run: |
         cd bedrock-service
         go install golang.org/x/vuln/cmd/govulncheck@latest || true
         govulncheck ./... || true
         if [ $? -eq 0 ]; then echo "✅ SCA passed - No known vulnerabilities"; else echo "⚠️ SCA found vulnerabilities but continuing"; fi
-    
+
     - name: Static Application Security Testing (SAST) 🔒
       run: |
         cd bedrock-service
         go install github.com/securecodewarrior/gosec/v2/cmd/gosec@v2.18.2 || true
         gosec ./... || true
         if [ $? -eq 0 ]; then echo "✅ SAST passed - No security issues"; else echo "⚠️ SAST found issues but continuing"; fi
-    
+
     - name: Build Application 🛠️
       run: |
         cd bedrock-service
         CGO_ENABLED=0 go build -o bedrock-service .
         if [ $? -eq 0 ]; then echo "✅ Build successful"; else echo "❌ Build failed" && exit 1; fi
-    
+
     - name: Run Unit Tests ✅
       run: |
         cd bedrock-service
@@ -107,30 +107,30 @@ EOF
         fi
         go test ./... || true
         if [ $? -eq 0 ]; then echo "✅ Tests passed"; else echo "⚠️ Some tests failed but continuing"; fi
-    
+
     - name: Log in to Docker Hub
       uses: docker/login-action@v3
       with:
         username: ${{ env.DOCKER_USERNAME }}
         password: ${{ env.DOCKER_PASSWORD }}
-    
+
     - name: Create Docker Image 🐳
       run: |
         IMAGE_TAG="${{ env.DOCKER_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
         docker build -t $IMAGE_TAG -f ./bedrock-service/Dockerfile ./bedrock-service
-    
+
     - name: Push Docker Image to Docker Hub 🚢
       run: |
         IMAGE_TAG="${{ env.DOCKER_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
         docker push $IMAGE_TAG
-    
+
     - name: Update and push deployment manifest
       run: |
         git config --global user.name "github-actions[bot]"
         git config --global user.email "github-actions[bot]@users.noreply.github.com"
-        
+
         sed -i "s|image: .*/bedrock-service:.*|image: ${{ env.DOCKER_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}|g" bedrock-service/k8s/deployment.yaml
-        
+
         git add bedrock-service/k8s/deployment.yaml
         git diff --staged --quiet || git commit -m "chore: Update bedrock-service image tag to ${{ github.sha }} [skip ci]"
         git push || echo "Push completed"
