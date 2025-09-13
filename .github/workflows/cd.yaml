@@ -27,36 +27,34 @@ jobs:
         echo "⏳ Waiting for infrastructure to be ready..."
         
         # Wait for namespace
-        timeout 300 bash -c 'until kubectl get namespace bedrock-chat 2>/dev/null; do echo "Waiting for namespace..."; sleep 10; done'
+        timeout 300 bash -c 'until kubectl get namespace bedrock-chat-v2 2>/dev/null; do echo "Waiting for namespace..."; sleep 10; done'
         
         # Wait for AWS secrets (this service needs AWS credentials)
-        timeout 300 bash -c 'until kubectl get secret aws-secrets -n bedrock-chat 2>/dev/null; do echo "Waiting for AWS secrets..."; sleep 10; done'
+        timeout 300 bash -c 'until kubectl get secret app-secrets -n bedrock-chat-v2 2>/dev/null; do echo "Waiting for AWS secrets..."; sleep 10; done'
         
         echo "✅ Infrastructure dependencies verified!"
     
-    - name: Get latest image tag
-      id: get-image
+    - name: Update AWS secrets with organization secrets
       run: |
-        IMAGE_TAG="ghcr.io/${{ github.repository_owner }}/bedrock-chat-bedrock-service:latest"
-        echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
-        echo "Using image: $IMAGE_TAG"
-    
-    - name: Update deployment manifests
-      run: |
-        cd k8s
-        sed -i "s|image: ghcr.io/.*/bedrock-chat-bedrock-service:.*|image: ${{ steps.get-image.outputs.image-tag }}|g" deployment.yaml
+        echo "🔐 Updating AWS credentials from organization secrets..."
         
-        echo "Updated deployment.yaml:"
-        grep "image:" deployment.yaml
+        # Update the app-secrets with AWS credentials from organization secrets
+        kubectl create secret generic app-secrets \
+          --from-literal=AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY }}" \
+          --from-literal=AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_KEY }}" \
+          -n bedrock-chat-v2 \
+          --dry-run=client -o yaml | kubectl apply -f -
+        
+        echo "✅ AWS credentials updated successfully!"
     
     - name: Deploy Bedrock Service
       run: |
         echo "🚀 Deploying Bedrock Service to Kubernetes..."
         
-        kubectl apply -f k8s/ -n bedrock-chat
+        kubectl apply -f bedrock-service/k8s/ -n bedrock-chat-v2
         
         echo "⏳ Waiting for deployment rollout..."
-        kubectl rollout status deployment/bedrock-service -n bedrock-chat --timeout=300s
+        kubectl rollout status deployment/bedrock-service -n bedrock-chat-v2 --timeout=300s
         
         echo "✅ Bedrock Service deployed successfully!"
     
@@ -64,12 +62,12 @@ jobs:
       run: |
         echo "🔍 Verifying Bedrock Service deployment..."
         
-        kubectl get pods -n bedrock-chat -l app=bedrock-service -o wide
-        kubectl get service bedrock-service -n bedrock-chat
-        kubectl logs -n bedrock-chat -l app=bedrock-service --tail=20
+        kubectl get pods -n bedrock-chat-v2 -l app=bedrock-service -o wide
+        kubectl get service bedrock-service -n bedrock-chat-v2
+        kubectl logs -n bedrock-chat-v2 -l app=bedrock-service --tail=20
         
-        kubectl run test-bedrock-service-$RANDOM --image=curlimages/curl --rm -i --restart=Never -n bedrock-chat -- \
-          curl -f http://bedrock-service.bedrock-chat.svc.cluster.local:9000/health || echo "Health check completed"
+        kubectl run test-bedrock-service-$RANDOM --image=curlimages/curl --rm -i --restart=Never -n bedrock-chat-v2 -- \
+          curl -f http://bedrock-service.bedrock-chat-v2.svc.cluster.local:9000/health || echo "Health check completed"
         
         echo "✅ Bedrock Service verification completed!"
     
