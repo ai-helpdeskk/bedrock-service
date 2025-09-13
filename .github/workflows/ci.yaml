@@ -1,136 +1,132 @@
-name: Bedrock Service CI
+# File: .github/workflows/bedrock-service-ci.yaml
+name: CI - Bedrock Service
 
 on:
   push:
-    branches: [main, develop]
+    branches:
+      - '**'
     paths:
       - 'bedrock-service/**'
-      - '.github/workflows/bedrock-ci.yaml'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'bedrock-service/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/bedrock-chat-bedrock-service
-  CGO_ENABLED: 1
-
-defaults:
-  run:
-    working-directory: bedrock-service
+  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+  DOCKER_REPO: ${{ secrets.DOCKER_USERNAME }}
+  IMAGE_NAME: bedrock-service
 
 jobs:
-  lint:
   ci-pipeline:
     runs-on: self-hosted
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Setup Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.21'
-        cache: true
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
 
-    - name: Install dependencies
-      run: |
-        cd bedrock-service
-        go mod download
-        go mod tidy
+      - name: Install dependencies
+        run: |
+          cd bedrock-service
+          go mod download
+          go mod tidy
 
-    - name: CI Linting 🧹
-      run: |
-        cd bedrock-service
-        unformatted_files=$(find . -name "*.go" -not -path "./vendor/*" | xargs gofmt -s -l 2>/dev/null || true)
-        if [ -n "$unformatted_files" ]; then
-          echo "❌ Linting failed - files not formatted: $unformatted_files"
-          exit 1
-        fi
-        echo "✅ Linting passed"
+      - name: CI Linting 🧹
+        run: |
+          cd bedrock-service
+          unformatted_files=$(find . -name "*.go" -not -path "./vendor/*" | xargs gofmt -s -l 2>/dev/null || true)
+          if [ -n "$unformatted_files" ]; then
+            echo "❌ Linting failed - files not formatted: $unformatted_files"
+            exit 1
+          fi
+          echo "✅ Linting passed"
 
-    - name: Static Code Analysis 🔍
-      run: |
-        cd bedrock-service
-        go vet ./...
-        if [ $? -eq 0 ]; then echo "✅ Code analysis passed"; else echo "❌ Code analysis failed" && exit 1; fi
+      - name: Source Code Analysis 🔍
+        run: |
+          cd bedrock-service
+          go vet ./...
+          if [ $? -eq 0 ]; then echo "✅ Code analysis passed"; else echo "❌ Code analysis failed" && exit 1; fi
 
-    - name: Software Component Analysis (SCA) 📦
-      run: |
-        cd bedrock-service
-        go install golang.org/x/vuln/cmd/govulncheck@latest || true
-        govulncheck ./... || true
-        if [ $? -eq 0 ]; then echo "✅ SCA passed - No known vulnerabilities"; else echo "⚠️ SCA found vulnerabilities but continuing"; fi
+      - name: Software Component Analysis (SCA) 📦
+        run: |
+          cd bedrock-service
+          go install golang.org/x/vuln/cmd/govulncheck@latest || true
+          govulncheck ./... || true
+          if [ $? -eq 0 ]; then echo "✅ SCA passed - No known vulnerabilities"; else echo "⚠️ SCA found vulnerabilities but continuing"; fi
 
-    - name: Static Application Security Testing (SAST) 🔒
-      run: |
-        cd bedrock-service
-        go install github.com/securecodewarrior/gosec/v2/cmd/gosec@v2.18.2 || true
-        gosec ./... || true
-        if [ $? -eq 0 ]; then echo "✅ SAST passed - No security issues"; else echo "⚠️ SAST found issues but continuing"; fi
+      - name: Static Application Security Testing (SAST) 🔒
+        run: |
+          cd bedrock-service
+          go install github.com/securecodewarrior/gosec/v2/cmd/gosec@v2.18.2 || true
+          gosec ./... || true
+          if [ $? -eq 0 ]; then echo "✅ SAST passed - No security issues"; else echo "⚠️ SAST found issues but continuing"; fi
 
-    - name: Build Application 🛠️
-      run: |
-        cd bedrock-service
-        CGO_ENABLED=0 go build -o bedrock-service .
-        if [ $? -eq 0 ]; then echo "✅ Build successful"; else echo "❌ Build failed" && exit 1; fi
+      - name: Build Application 🛠️
+        run: |
+          cd bedrock-service
+          CGO_ENABLED=0 go build -o bedrock-service .
+          if [ $? -eq 0 ]; then echo "✅ Build successful"; else echo "❌ Build failed" && exit 1; fi
 
-    - name: Run Unit Tests ✅
-      run: |
-        cd bedrock-service
-        # Create basic test if not exists
-        if [ ! -f main_test.go ]; then
-          cat > main_test.go << 'EOF'
-package main
-import (
-	"net/http"
-	"net/http/httptest"
-	"strings"
-	"testing"
-)
-func TestRootHandler(t *testing.T) {
-	req, _ := http.NewRequest("GET", "/", nil)
-	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(rootHandler)
-	handler.ServeHTTP(rr, req)
-	if status := rr.Code; status != http.StatusOK {
-		t.Errorf("handler returned wrong status code: got %v want %v", status, http.StatusOK)
-	}
-}
-func TestMinFunction(t *testing.T) {
-	if result := min(5, 3); result != 3 {
-		t.Errorf("min(5, 3) = %d; want 3", result)
-	}
-}
-EOF
-        fi
-        go test ./... || true
-        if [ $? -eq 0 ]; then echo "✅ Tests passed"; else echo "⚠️ Some tests failed but continuing"; fi
+      - name: Run Unit Tests ✅
+        run: |
+          cd bedrock-service
+          # Create basic test if not exists
+          if [ ! -f main_test.go ]; then
+            cat > main_test.go << 'EOF'
+          package main
+          import (
+            "net/http"
+            "net/http/httptest"
+            "strings"
+            "testing"
+          )
+          func TestRootHandler(t *testing.T) {
+            req, _ := http.NewRequest("GET", "/", nil)
+            rr := httptest.NewRecorder()
+            handler := http.HandlerFunc(rootHandler)
+            handler.ServeHTTP(rr, req)
+            if status := rr.Code; status != http.StatusOK {
+              t.Errorf("handler returned wrong status code: got %v want %v", status, http.StatusOK)
+            }
+          }
+          func TestMinFunction(t *testing.T) {
+            if result := min(5, 3); result != 3 {
+              t.Errorf("min(5, 3) = %d; want 3", result)
+            }
+          }
+          EOF
+          fi
+          go test ./... || true
+          if [ $? -eq 0 ]; then echo "✅ Tests passed"; else echo "⚠️ Some tests failed but continuing"; fi
 
-    - name: Log in to Docker Hub
-      uses: docker/login-action@v3
-      with:
-        username: ${{ env.DOCKER_USERNAME }}
-        password: ${{ env.DOCKER_PASSWORD }}
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKER_USERNAME }}
+          password: ${{ env.DOCKER_PASSWORD }}
 
-    - name: Create Docker Image 🐳
-      run: |
-        IMAGE_TAG="${{ env.DOCKER_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
-        docker build -t $IMAGE_TAG -f ./bedrock-service/Dockerfile ./bedrock-service
+      - name: Create Docker Image 🐳
+        run: |
+          IMAGE_TAG="${{ env.DOCKER_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          docker build -t $IMAGE_TAG -f ./bedrock-service/Dockerfile ./bedrock-service
 
-    - name: Push Docker Image to Docker Hub 🚢
-      run: |
-        IMAGE_TAG="${{ env.DOCKER_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
-        docker push $IMAGE_TAG
+      - name: Push Docker Image to Docker Hub 🚢
+        run: |
+          IMAGE_TAG="${{ env.DOCKER_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          docker push $IMAGE_TAG
 
-    - name: Update and push deployment manifest
-      run: |
-        git config --global user.name "github-actions[bot]"
-        git config --global user.email "github-actions[bot]@users.noreply.github.com"
-
-        sed -i "s|image: .*/bedrock-service:.*|image: ${{ env.DOCKER_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}|g" bedrock-service/k8s/deployment.yaml
-
-        git add bedrock-service/k8s/deployment.yaml
-        git diff --staged --quiet || git commit -m "chore: Update bedrock-service image tag to ${{ github.sha }} [skip ci]"
-        git push || echo "Push completed"
+      - name: Update and push deployment manifest
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          sed -i "s|image: samitsinghhh/bedrock-service:.*|image: ${{ env.DOCKER_REPO }}/${{ env.IMAGE_NAME }}:${{ github.sha }}|g" bedrock-service/k8s/deployment.yaml
+          
+          git add bedrock-service/k8s/deployment.yaml
+          git diff --staged --quiet || git commit -m "chore: Update bedrock-service image tag to ${{ github.sha }} [skip ci]"
+          git push
