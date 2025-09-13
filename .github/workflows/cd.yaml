@@ -29,7 +29,7 @@ jobs:
         # Wait for namespace
         timeout 300 bash -c 'until kubectl get namespace bedrock-chat-v2 2>/dev/null; do echo "Waiting for namespace..."; sleep 10; done'
         
-        # Wait for AWS secrets (this service needs AWS credentials)
+        # Wait for AWS secrets
         timeout 300 bash -c 'until kubectl get secret app-secrets -n bedrock-chat-v2 2>/dev/null; do echo "Waiting for AWS secrets..."; sleep 10; done'
         
         echo "✅ Infrastructure dependencies verified!"
@@ -51,7 +51,7 @@ jobs:
       run: |
         echo "🚀 Deploying Bedrock Service to Kubernetes..."
         
-        kubectl apply -f bedrock-service/k8s/ -n bedrock-chat-v2
+        kubectl apply -f k8s/ -n bedrock-chat-v2
         
         echo "⏳ Waiting for deployment rollout..."
         kubectl rollout status deployment/bedrock-service -n bedrock-chat-v2 --timeout=300s
@@ -75,3 +75,4 @@ jobs:
       run: |
         echo "🎉 **Bedrock Service Deployment Successful!**"
         echo "🔧 **AWS Configuration**: Using organization secrets for AWS credentials"
+        echo "🏷️ **Image**: Using static image samitsinghhh/bedrock-service:v3"
