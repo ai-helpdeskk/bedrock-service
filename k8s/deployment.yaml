@@ -19,7 +19,7 @@ spec:
         - name: docker-hub-secret
       containers:
         - name: bedrock-service
-          image: samitsinghhh/bedrock-service:ca87f056cb17bb31e0f961d230095ba109a6364c
+          image: samitsinghhh/bedrock-service:v3
           imagePullPolicy: Always
           ports:
             - containerPort: 9000
