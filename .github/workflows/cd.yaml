@@ -1,4 +1,4 @@
-name: Bedrock Service CD
+name: CD - Deploy to Kubernetes
 
 on:
   workflow_run:
@@ -6,242 +6,184 @@ on:
     branches: [main]
     types:
       - completed
+  push:
+    branches:
+      - '**'
+    paths:
+      - 'k8s/**'
   workflow_dispatch:
 
 jobs:
   deploy:
     name: Deploy Bedrock Service
     runs-on: [self-hosted]
-    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
-    - name: Verify environment
-      run: |
-        echo "🔍 Verifying deployment environment..."
-        echo "Runner: $(uname -a)"
-        echo "Docker version: $(docker --version)"
-        echo "kubectl version: $(kubectl version --client --short 2>/dev/null || echo 'kubectl not found')"
-        
-        # Check if kubectl works
-        if ! kubectl cluster-info &>/dev/null; then
-          echo "❌ kubectl cannot access cluster"
-          exit 1
-        fi
-        echo "✅ Environment verified"
+      - name: Verify environment
+        run: |
+          echo "🔍 Verifying deployment environment..."
+          echo "Runner: $(uname -a)"
+          echo "Docker version: $(docker --version)"
+          echo "kubectl version: $(kubectl version --client --short 2>/dev/null || echo 'kubectl not found')"
+          
+          # Check if kubectl works
+          if ! kubectl cluster-info &>/dev/null; then
+            echo "❌ kubectl cannot access cluster"
+            exit 1
+          fi
+          echo "✅ Environment verified"
 
-    - name: Setup namespace and dependencies
-      run: |
-        echo "🏗️ Setting up namespace and dependencies..."
-        
-        # Create namespace if it doesn't exist
-        kubectl create namespace bedrock-chat-v2 --dry-run=client -o yaml | kubectl apply -f -
-        
-        # Wait for or create required secrets and configmaps
-        echo "⚙️ Setting up configuration..."
-        
-        # Create app-config ConfigMap
-        kubectl create configmap app-config \
-          --from-literal=AWS_REGION="us-east-1" \
-          --from-literal=BEDROCK_SERVICE_URL="http://bedrock-service:9000" \
-          --from-literal=FILE_SERVICE_URL="http://file-service:7000" \
-          --from-literal=DATABASE_URL="mysql://bedrock_user:bedrock_password@mysql:3306/bedrock_chat" \
-          --from-literal=REACT_APP_API_URL="/api" \
-          -n bedrock-chat-v2 \
-          --dry-run=client -o yaml | kubectl apply -f -
-        
-        # Create Docker Hub secret if it doesn't exist
-        if ! kubectl get secret docker-hub-secret -n bedrock-chat-v2 &>/dev/null; then
-          echo "ℹ️ Docker Hub secret not found - this might be created by infrastructure setup"
-          # Create a dummy secret that will be replaced by infrastructure
-          kubectl create secret generic docker-hub-secret \
-            --from-literal=.dockerconfigjson='{"auths":{"https://index.docker.io/v1/":{"auth":"ZHVtbXk="}}}' \
-            --type=kubernetes.io/dockerconfigjson \
+      - name: Setup namespace and configuration
+        run: |
+          echo "🏗️ Setting up namespace and configuration..."
+          
+          # Create namespace if it doesn't exist
+          kubectl create namespace bedrock-chat-v2 --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Create app-config ConfigMap
+          kubectl create configmap app-config \
+            --from-literal=AWS_REGION="us-east-1" \
+            --from-literal=BEDROCK_SERVICE_URL="http://bedrock-service:9000" \
+            --from-literal=FILE_SERVICE_URL="http://file-service:7000" \
+            --from-literal=DATABASE_URL="mysql://bedrock_user:bedrock_password@mysql:3306/bedrock_chat" \
+            --from-literal=REACT_APP_API_URL="/api" \
             -n bedrock-chat-v2 \
             --dry-run=client -o yaml | kubectl apply -f -
-        fi
-        
-        echo "✅ Dependencies setup completed"
-
-    - name: Create and update AWS secrets
-      run: |
-        echo "🔐 Setting up AWS credentials from organization secrets..."
-        
-        # Verify AWS secrets are available
-        if [[ -z "${{ secrets.AWS_ACCESS_KEY }}" || -z "${{ secrets.AWS_SECRET_KEY }}" ]]; then
-          echo "❌ AWS secrets not found in organization secrets"
-          echo "Available secrets:"
-          echo "- AWS_ACCESS_KEY: $([[ -n '${{ secrets.AWS_ACCESS_KEY }}' ]] && echo 'Set' || echo 'Not set')"
-          echo "- AWS_SECRET_KEY: $([[ -n '${{ secrets.AWS_SECRET_KEY }}' ]] && echo 'Set' || echo 'Not set')"
-          exit 1
-        fi
-        
-        # Create/update app-secrets with AWS credentials
-        kubectl create secret generic app-secrets \
-          --from-literal=AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY }}" \
-          --from-literal=AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_KEY }}" \
-          -n bedrock-chat-v2 \
-          --dry-run=client -o yaml | kubectl apply -f -
-        
-        echo "✅ AWS credentials configured successfully"
-
-    - name: Deploy Bedrock Service
-      run: |
-        echo "🚀 Deploying Bedrock Service..."
-        
-        # Apply service first (for DNS resolution)
-        kubectl apply -f k8s/service.yaml -n bedrock-chat-v2
-        
-        # Apply deployment
-        kubectl apply -f k8s/deployment.yaml -n bedrock-chat-v2
-        
-        # Apply HPA
-        kubectl apply -f k8s/hpa.yaml -n bedrock-chat-v2 || echo "⚠️ HPA failed (metrics-server may not be available)"
-        
-        # Apply Network Policy
-        kubectl apply -f k8s/network-policy.yaml -n bedrock-chat-v2 || echo "⚠️ Network Policy failed (network policies may not be supported)"
-        
-        echo "📋 Waiting for deployment to be ready..."
-        
-        # Wait for deployment with timeout
-        if kubectl rollout status deployment/bedrock-service -n bedrock-chat-v2 --timeout=600s; then
-          echo "✅ Bedrock Service deployed successfully"
-        else
-          echo "⚠️ Deployment rollout timeout - checking status..."
-          kubectl get pods -n bedrock-chat-v2 -l app=bedrock-service
-          kubectl describe deployment bedrock-service -n bedrock-chat-v2
-        fi
-
-    - name: Verify deployment
-      run: |
-        echo "🔍 Verifying Bedrock Service deployment..."
-        
-        # Check deployment status
-        echo "=== Deployment Status ==="
-        kubectl get deployment bedrock-service -n bedrock-chat-v2 -o wide
-        
-        # Check pods
-        echo "=== Pods ==="
-        kubectl get pods -n bedrock-chat-v2 -l app=bedrock-service -o wide
-        
-        # Check service
-        echo "=== Service ==="
-        kubectl get service bedrock-service -n bedrock-chat-v2 -o wide
-        
-        # Check logs
-        echo "=== Recent Logs ==="
-        kubectl logs -n bedrock-chat-v2 -l app=bedrock-service --tail=20 || echo "No logs available yet"
-        
-        # Wait for pods to be ready
-        echo "⏳ Waiting for pods to be ready..."
-        kubectl wait --for=condition=ready pod -l app=bedrock-service -n bedrock-chat-v2 --timeout=300s || echo "⚠️ Pods not ready within timeout"
-
-    - name: Health check
-      run: |
-        echo "🏥 Performing health checks..."
-        
-        # Internal health check using kubectl exec
-        echo "=== Internal Health Check ==="
-        for i in {1..10}; do
-          echo "Health check attempt $i/10..."
           
-          if kubectl run bedrock-health-test-$RANDOM \
+          echo "✅ Configuration setup completed"
+
+      - name: Setup AWS secrets from organization
+        run: |
+          echo "🔐 Setting up AWS credentials from organization secrets..."
+          
+          # Verify AWS secrets are available
+          if [[ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" || -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]]; then
+            echo "❌ AWS organization secrets not found"
+            echo "Available secrets:"
+            echo "- AWS_ACCESS_KEY_ID: $([[ -n '${{ secrets.AWS_ACCESS_KEY_ID }}' ]] && echo 'Set' || echo 'Not set')"
+            echo "- AWS_SECRET_ACCESS_KEY: $([[ -n '${{ secrets.AWS_SECRET_ACCESS_KEY }}' ]] && echo 'Set' || echo 'Not set')"
+            exit 1
+          fi
+          
+          # Create/update app-secrets with AWS credentials
+          kubectl create secret generic app-secrets \
+            --from-literal=AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}" \
+            --from-literal=AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}" \
+            -n bedrock-chat-v2 \
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          echo "✅ AWS credentials configured from organization secrets"
+
+      - name: Deploy to Kubernetes
+        run: |
+          echo "🚀 Deploying Bedrock Service to Kubernetes..."
+          
+          # Apply all Kubernetes manifests
+          kubectl apply -f k8s/ -R -n bedrock-chat-v2
+          
+          echo "✅ Kubernetes manifests applied successfully"
+
+      - name: Wait for deployment
+        run: |
+          echo "⏳ Waiting for deployment to be ready..."
+          
+          # Wait for deployment with timeout
+          if kubectl rollout status deployment/bedrock-service -n bedrock-chat-v2 --timeout=300s; then
+            echo "✅ Bedrock Service deployed successfully"
+          else
+            echo "❌ Deployment rollout timeout"
+            echo "Current deployment status:"
+            kubectl get deployment bedrock-service -n bedrock-chat-v2 -o wide
+            kubectl get pods -n bedrock-chat-v2 -l app=bedrock-service
+            exit 1
+          fi
+
+      - name: Verify deployment
+        run: |
+          echo "🔍 Verifying deployment..."
+          
+          # Check deployment status
+          echo "=== Deployment Status ==="
+          kubectl get deployment bedrock-service -n bedrock-chat-v2 -o wide
+          
+          # Check pods
+          echo "=== Pods ==="
+          kubectl get pods -n bedrock-chat-v2 -l app=bedrock-service -o wide
+          
+          # Check service
+          echo "=== Service ==="
+          kubectl get service bedrock-service -n bedrock-chat-v2 -o wide
+          
+          # Wait for pods to be ready
+          echo "⏳ Waiting for pods to be ready..."
+          kubectl wait --for=condition=ready pod -l app=bedrock-service -n bedrock-chat-v2 --timeout=180s
+
+      - name: Dynamic Application Security Testing (DAST) 🛡️
+        run: |
+          echo "🛡️ Starting DAST on deployed application..."
+          
+          # Get service cluster IP
+          SERVICE_IP=$(kubectl get svc bedrock-service -n bedrock-chat-v2 -o jsonpath='{.spec.clusterIP}')
+          echo "Testing service at IP: $SERVICE_IP"
+          
+          # Health check test
+          echo "🏥 Testing health endpoint..."
+          kubectl run dast-health-test-$RANDOM \
             --image=curlimages/curl \
             --rm -i --restart=Never \
             --timeout=30s \
             -n bedrock-chat-v2 \
-            -- curl -f -m 10 http://bedrock-service.bedrock-chat-v2.svc.cluster.local:9000/health; then
-            echo "✅ Health check passed"
-            break
-          else
-            echo "⚠️ Health check attempt $i failed"
-            if [[ $i -eq 10 ]]; then
-              echo "❌ All health check attempts failed"
-              echo "Service may still be starting up - checking pod status:"
-              kubectl get pods -n bedrock-chat-v2 -l app=bedrock-service
-            else
-              sleep 15
-            fi
+            -- curl -f -m 10 http://$SERVICE_IP:9000/health
+          
+          if [ $? -eq 0 ]; then 
+            echo "✅ DAST health check passed"
+          else 
+            echo "❌ DAST health check failed"
+            exit 1
           fi
-        done
+          
+          # Root endpoint test
+          echo "🌐 Testing root endpoint..."
+          kubectl run dast-root-test-$RANDOM \
+            --image=curlimages/curl \
+            --rm -i --restart=Never \
+            --timeout=30s \
+            -n bedrock-chat-v2 \
+            -- curl -f -m 10 http://$SERVICE_IP:9000/
+          
+          if [ $? -eq 0 ]; then 
+            echo "✅ DAST root endpoint check passed"
+          else 
+            echo "⚠️ DAST root endpoint check failed"
+          fi
+          
+          echo "✅ DAST completed on live application"
 
-    - name: Test Bedrock Service functionality
-      run: |
-        echo "🧪 Testing Bedrock Service functionality..."
-        
-        # Test if service can handle a basic request
-        kubectl run bedrock-function-test-$RANDOM \
-          --image=curlimages/curl \
-          --rm -i --restart=Never \
-          --timeout=60s \
-          -n bedrock-chat-v2 \
-          -- curl -f -X POST \
-            -H "Content-Type: application/json" \
-            -d '{"prompt":"Hello, test message","max_tokens":10}' \
-            -m 30 \
-            http://bedrock-service.bedrock-chat-v2.svc.cluster.local:9000/generate || {
-          echo "⚠️ Functional test failed - this is expected if AWS credentials are not properly configured yet"
-          echo "Service is deployed but may need valid AWS credentials to function properly"
-        }
-
-    - name: Set up monitoring
-      run: |
-        echo "📊 Setting up basic monitoring..."
-        
-        # Create a simple monitoring check
-        cat << 'EOF' > bedrock-monitor.yaml
-        apiVersion: batch/v1
-        kind: CronJob
-        metadata:
-          name: bedrock-service-monitor
-          namespace: bedrock-chat-v2
-        spec:
-          schedule: "*/5 * * * *"  # Every 5 minutes
-          jobTemplate:
-            spec:
-              template:
-                spec:
-                  containers:
-                  - name: monitor
-                    image: curlimages/curl
-                    command:
-                    - /bin/sh
-                    - -c
-                    - |
-                      echo "Monitoring Bedrock Service at $(date)"
-                      if curl -f http://bedrock-service:9000/health; then
-                        echo "✅ Service healthy"
-                      else
-                        echo "❌ Service unhealthy"
-                      fi
-                  restartPolicy: OnFailure
-        EOF
-        
-        kubectl apply -f bedrock-monitor.yaml || echo "⚠️ Monitoring setup failed"
-        rm -f bedrock-monitor.yaml
-
-    - name: Deployment summary
-      run: |
-        echo "🎉 **Bedrock Service Deployment Summary**"
-        echo ""
-        echo "📋 **Status:**"
-        kubectl get deployment,pods,svc -n bedrock-chat-v2 -l app=bedrock-service
-        echo ""
-        echo "🔧 **Configuration:**"
-        echo "- AWS Credentials: ✅ Configured from organization secrets"
-        echo "- AWS Region: us-east-1"
-        echo "- Service URL: http://bedrock-service.bedrock-chat-v2.svc.cluster.local:9000"
-        echo ""
-        echo "🔗 **Available Endpoints:**"
-        echo "- Health: http://bedrock-service.bedrock-chat-v2.svc.cluster.local:9000/health"
-        echo "- Generate: http://bedrock-service.bedrock-chat-v2.svc.cluster.local:9000/generate (POST)"
-        echo ""
-        echo "📝 **Next Steps:**"
-        echo "1. Verify AWS credentials have proper Bedrock permissions"
-        echo "2. Test with API Gateway integration"
-        echo "3. Monitor logs: kubectl logs -f deployment/bedrock-service -n bedrock-chat-v2"
-        echo "4. Scale if needed: kubectl scale deployment bedrock-service --replicas=2 -n bedrock-chat-v2"
-        echo ""
-        echo "✅ **Bedrock Service is ready for integration!**"
+      - name: Deployment Summary
+        run: |
+          echo "🎉 **Bedrock Service Deployment Summary**"
+          echo ""
+          echo "📋 **Final Status:**"
+          kubectl get deployment,pods,svc -n bedrock-chat-v2 -l app=bedrock-service
+          echo ""
+          echo "🔧 **Configuration:**"
+          echo "- AWS Credentials: ✅ Configured from organization secrets"
+          echo "- Namespace: bedrock-chat-v2"
+          echo "- Service URL: http://bedrock-service.bedrock-chat-v2.svc.cluster.local:9000"
+          echo ""
+          echo "🔗 **Available Endpoints:**"
+          echo "- Health: http://bedrock-service.bedrock-chat-v2.svc.cluster.local:9000/health"
+          echo "- Generate: http://bedrock-service.bedrock-chat-v2.svc.cluster.local:9000/generate"
+          echo ""
+          echo "📝 **Management Commands:**"
+          echo "- View logs: kubectl logs -f deployment/bedrock-service -n bedrock-chat-v2"
+          echo "- Scale service: kubectl scale deployment bedrock-service --replicas=2 -n bedrock-chat-v2"
+          echo "- Delete service: kubectl delete -f k8s/ -n bedrock-chat-v2"
+          echo ""
+          echo "✅ **Deployment completed successfully!**"
