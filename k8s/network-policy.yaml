@@ -11,6 +11,7 @@ spec:
   - Ingress
   - Egress
   ingress:
+  # Allow traffic from API Gateway only
   - from:
     - podSelector:
         matchLabels:
@@ -19,12 +20,14 @@ spec:
     - protocol: TCP
       port: 9000
   egress:
+  # Allow external access to AWS Bedrock APIs
   - to: []
     ports:
     - protocol: TCP
-      port: 443
+      port: 443  # HTTPS for AWS APIs
     - protocol: TCP
-      port: 80
+      port: 80   # HTTP if needed
+  # Allow DNS resolution
   - to: []
     ports:
     - protocol: UDP
